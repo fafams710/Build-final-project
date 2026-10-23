@@ -1,0 +1,2 @@
+# Python dependencies for the whole project (frontend uses npm: see frontend/package.json).
+-r backend/requirements.txt
