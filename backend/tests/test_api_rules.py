@@ -1,4 +1,4 @@
-BASE = {"symbol": "aapl", "type": "price_above", "threshold": 100, "webhook_url": "http://h.example/x"}
+BASE = {"symbol": "aapl", "type": "price_above", "threshold": 100}
 
 
 def test_create_list_delete(client):
@@ -6,6 +6,9 @@ def test_create_list_delete(client):
     assert r.status_code == 201
     rule = r.json()
     assert rule["symbol"] == "AAPL" and rule["id"]
+    keys = {"id", "symbol", "type", "threshold", "window_seconds", "created_at"}
+    assert set(rule) == keys
+    assert all(set(x) == keys for x in client.get("/api/rules").json())
 
     client.post("/api/rules", json={**BASE, "symbol": "MSFT", "type": "price_below"})
     assert len(client.get("/api/rules").json()) == 2
@@ -24,7 +27,6 @@ def test_percent_rule_requires_window(client):
 
 
 def test_validation_rejects_bad_input(client):
-    assert client.post("/api/rules", json={**BASE, "webhook_url": "ftp://x"}).status_code == 422
     assert client.post("/api/rules", json={**BASE, "threshold": -1}).status_code == 422
     assert client.post("/api/rules", json={**BASE, "type": "nope"}).status_code == 422
     assert client.post("/api/rules", json={**BASE, "symbol": "bad symbol!"}).status_code == 422
