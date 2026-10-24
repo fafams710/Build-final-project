@@ -33,7 +33,7 @@ Without a `FINNHUB_API_KEY` the backend still starts, but no market data flows.
 Backend:
 ```
 cd backend
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 pytest
 uvicorn app.main:app --reload
 ```
