@@ -69,7 +69,6 @@ describe("Dashboard", () => {
 
     fireEvent.change(screen.getByLabelText("rule symbol"), { target: { value: "msft" } });
     fireEvent.change(screen.getByLabelText("threshold"), { target: { value: "300" } });
-    fireEvent.change(screen.getByLabelText("webhook url"), { target: { value: "https://h.example/x" } });
     fireEvent.click(screen.getByText("Create rule"));
 
     await waitFor(() => {
@@ -80,6 +79,7 @@ describe("Dashboard", () => {
         type: "price_above",
         threshold: 300,
       });
+      expect(Object.keys(JSON.parse(post![1]!.body as string)).sort()).toEqual(["symbol", "threshold", "type"]);
     });
   });
 });

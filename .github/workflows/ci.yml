@@ -8,17 +8,8 @@ jobs:
   backend:
     runs-on: ubuntu-latest
     services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-      timescaledb:
-        image: timescale/timescaledb:latest-pg16
+      postgres:
+        image: postgres:16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: ci_only_password
@@ -43,7 +34,6 @@ jobs:
       - run: pip install -r requirements.txt
       - run: pytest
         env:
-          REDIS_URL: redis://localhost:6379/0
           DATABASE_URL: postgresql://postgres:ci_only_password@localhost:5432/ticks
 
   frontend:

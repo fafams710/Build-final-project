@@ -1,8 +1,6 @@
 from app.models import RuleCreate, Tick
 from app.rules import RuleEngine, RuleStore
 
-URL = "http://hook.example/x"
-
 
 def tick(price, t=0, symbol="AAPL"):
     return Tick(symbol=symbol, price=price, ts_ms=int(t * 1000))
@@ -11,7 +9,7 @@ def tick(price, t=0, symbol="AAPL"):
 async def setup(*rules):
     store = RuleStore()
     for r in rules:
-        await store.add(RuleCreate(webhook_url=URL, symbol="AAPL", **r))
+        await store.add(RuleCreate(symbol="AAPL", **r))
     return store, RuleEngine(store)
 
 
@@ -69,7 +67,7 @@ async def test_store_crud_and_persistence_errors_are_swallowed():
 
     store = RuleStore(repo=BrokenRepo())
     await store.load()
-    rule = await store.add(RuleCreate(symbol="aapl", type="price_above", threshold=1, webhook_url=URL))
+    rule = await store.add(RuleCreate(symbol="aapl", type="price_above", threshold=1))
     assert store.list() == [rule] and rule.symbol == "AAPL"
     assert await store.remove(rule.id) is True
     assert await store.remove(rule.id) is False
