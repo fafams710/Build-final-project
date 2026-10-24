@@ -8,13 +8,13 @@ def tick_msg(ws):
             return m
 
 
-def test_single_upstream_started_and_stopped_once(settings, fake_cache, webhooks):
+def test_single_upstream_started_and_stopped_once(settings):
     from fastapi.testclient import TestClient
 
     from app.main import create_app
 
     FakeFinnhubClient.instances.clear()
-    app = create_app(settings, upstream_factory=FakeFinnhubClient.factory, cache=fake_cache, webhooks=webhooks)
+    app = create_app(settings, upstream_factory=FakeFinnhubClient.factory)
     with TestClient(app) as c:
         with c.websocket_connect("/ws") as a, c.websocket_connect("/ws") as b:
             for ws in (a, b):
@@ -63,41 +63,34 @@ def test_subscribe_dedupes_upstream_and_fans_out_per_symbol(client):
     assert client.get("/api/symbols").json() == []
 
 
-def test_snapshot_from_cache_on_subscribe(client, fake_cache):
-    fake_cache.prices["AAPL"] = {"price": 42.0, "ts_ms": 5, "volume": 1.0}
+def test_subscribe_without_snapshot_and_error_replies(client):
     with client.websocket_connect("/ws") as ws:
-        ws.send_json({"action": "subscribe", "symbol": "AAPL"})
-        assert ws.receive_json()["type"] == "subscribed"
-        snap = ws.receive_json()
-        assert snap["type"] == "snapshot" and snap["price"] == 42.0
-        # no cache entry: just subscribed, no error
         ws.send_json({"action": "subscribe", "symbol": "NEW"})
-        assert ws.receive_json()["type"] == "subscribed"
+        assert ws.receive_json() == {"type": "subscribed", "symbol": "NEW"}
         ws.send_json({"action": "bogus", "symbol": "NEW"})
         assert ws.receive_json()["type"] == "error"
         ws.send_text("not json")
         assert ws.receive_json()["type"] == "error"
 
 
-def test_tick_updates_cache_and_rule_fires_webhook(client, fake_cache, webhooks):
+def test_rule_fires_one_info_log_and_tick_still_broadcast(client, caplog):
+    import logging
+
     from app.models import Tick
 
     up = FakeFinnhubClient.instances[0]
-    r = client.post(
-        "/api/rules",
-        json={"symbol": "AAPL", "type": "price_above", "threshold": 100, "webhook_url": "http://h.example/x"},
-    )
+    r = client.post("/api/rules", json={"symbol": "AAPL", "type": "price_above", "threshold": 100})
     assert r.status_code == 201
-    client.portal.call(up.on_tick, Tick(symbol="AAPL", price=101.0, ts_ms=1))
-    client.portal.call(up.on_tick, Tick(symbol="AAPL", price=102.0, ts_ms=2))
-    assert len(webhooks.calls) == 1
-    assert webhooks.calls[0][0] == "http://h.example/x"
-    assert webhooks.calls[0][1]["rule_id"] == r.json()["id"]
-    import time
-
-    for _ in range(100):
-        if fake_cache.prices.get("AAPL", {}).get("price") == 102.0:
-            break
-        time.sleep(0.02)
-    assert fake_cache.prices["AAPL"]["price"] == 102.0
-    assert client.get("/health").json() == {"status": "ok"}
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"action": "subscribe", "symbol": "AAPL"})
+        assert ws.receive_json()["type"] == "subscribed"
+        with caplog.at_level(logging.INFO, logger="app.main"):
+            client.portal.call(up.on_tick, Tick(symbol="AAPL", price=101.0, ts_ms=1))
+            client.portal.call(up.on_tick, Tick(symbol="AAPL", price=102.0, ts_ms=2))
+        assert tick_msg(ws)["price"] == 101.0
+        assert tick_msg(ws)["price"] == 102.0
+    fired = [x for x in caplog.records if x.levelno == logging.INFO and "rule fired" in x.getMessage()]
+    assert len(fired) == 1
+    msg = fired[0].getMessage()
+    for part in (r.json()["id"], "AAPL", "price_above", "100", "101.0"):
+        assert part in msg

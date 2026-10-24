@@ -32,17 +32,6 @@ async def ws_endpoint(websocket: WebSocket) -> None:
             if action == "subscribe":
                 await svc.subscriptions.subscribe(conn_id, symbol)
                 await reply({"type": "subscribed", "symbol": symbol})
-                snapshot = await svc.cache.get_price(symbol)
-                if snapshot:
-                    await reply(
-                        {
-                            "type": "snapshot",
-                            "symbol": symbol,
-                            "price": snapshot.get("price"),
-                            "volume": snapshot.get("volume"),
-                            "timestamp": snapshot.get("ts_ms"),
-                        }
-                    )
             elif action == "unsubscribe":
                 await svc.subscriptions.unsubscribe(conn_id, symbol)
                 await reply({"type": "unsubscribed", "symbol": symbol})

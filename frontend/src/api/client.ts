@@ -5,7 +5,6 @@ export interface RuleInput {
   type: RuleType;
   threshold: number;
   window_seconds?: number;
-  webhook_url: string;
 }
 
 export interface Rule extends RuleInput {

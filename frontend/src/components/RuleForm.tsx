@@ -6,7 +6,6 @@ export default function RuleForm({ onCreated }: { onCreated: () => void }) {
   const [type, setType] = useState<RuleType>("price_above");
   const [threshold, setThreshold] = useState("");
   const [windowSeconds, setWindowSeconds] = useState("60");
-  const [url, setUrl] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const submit = async (e: FormEvent) => {
@@ -18,7 +17,6 @@ export default function RuleForm({ onCreated }: { onCreated: () => void }) {
         type,
         threshold: Number(threshold),
         window_seconds: type === "percent_change" ? Number(windowSeconds) : undefined,
-        webhook_url: url.trim(),
       });
       setThreshold("");
       onCreated();
@@ -39,7 +37,6 @@ export default function RuleForm({ onCreated }: { onCreated: () => void }) {
       {type === "percent_change" && (
         <input aria-label="window seconds" type="number" min="1" value={windowSeconds} onChange={(e) => setWindowSeconds(e.target.value)} required />
       )}
-      <input aria-label="webhook url" type="url" placeholder="https://example.com/hook" value={url} onChange={(e) => setUrl(e.target.value)} required />
       <button type="submit">Create rule</button>
       {error && <p role="alert">{error}</p>}
     </form>

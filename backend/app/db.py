@@ -1,4 +1,4 @@
-"""Best-effort Postgres/TimescaleDB persistence for rules and ticks."""
+"""Best-effort plain Postgres persistence for rules and ticks."""
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -22,11 +22,9 @@ SCHEMA = [
         type TEXT NOT NULL,
         threshold DOUBLE PRECISION NOT NULL,
         window_seconds DOUBLE PRECISION,
-        webhook_url TEXT NOT NULL,
         created_at DOUBLE PRECISION NOT NULL
     )""",
 ]
-HYPERTABLE = "SELECT create_hypertable('ticks', 'exchange_ts', if_not_exists => TRUE)"
 
 
 def _ts(seconds: float) -> datetime:
@@ -64,10 +62,6 @@ class Database:
             async with self._pool.acquire() as conn:
                 for stmt in SCHEMA:
                     await conn.execute(stmt)
-                try:
-                    await conn.execute(HYPERTABLE)
-                except Exception as exc:
-                    log.warning("create_hypertable failed (plain table used): %s", exc)
             if self._persist_ticks:
                 self._worker = asyncio.create_task(self._tick_worker(), name="tick-writer")
         except Exception as exc:
@@ -131,11 +125,11 @@ class Database:
             async with self._pool.acquire() as conn:
                 await conn.execute(
                     "INSERT INTO alert_rules (id, symbol, type, threshold, window_seconds, "
-                    "webhook_url, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7) "
+                    "created_at) VALUES ($1,$2,$3,$4,$5,$6) "
                     "ON CONFLICT (id) DO UPDATE SET symbol=$2, type=$3, threshold=$4, "
-                    "window_seconds=$5, webhook_url=$6",
+                    "window_seconds=$5",
                     rule.id, rule.symbol, rule.type.value, rule.threshold,
-                    rule.window_seconds, rule.webhook_url, rule.created_at,
+                    rule.window_seconds, rule.created_at,
                 )
         except Exception as exc:
             log.error("save_rule failed: %s", type(exc).__name__)

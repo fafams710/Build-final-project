@@ -12,11 +12,9 @@ from .connection_manager import ConnectionManager
 from .db import Database
 from .finnhub_client import FinnhubClient
 from .models import Tick
-from .redis_cache import PriceCache
 from .routers import health, rules as rules_router, symbols, ws
 from .rules import RuleEngine, RuleStore
 from .subscription_manager import SubscriptionManager
-from .webhooks import WebhookDispatcher
 
 log = logging.getLogger(__name__)
 
@@ -41,12 +39,11 @@ def default_upstream_factory(settings: Settings, on_tick, get_symbols) -> Option
 class Services:
     """Wires the components together; one instance per app."""
 
-    def __init__(self, settings: Settings, cache=None, db=None, webhooks=None) -> None:
+    def __init__(self, settings: Settings, db=None) -> None:
         self.settings = settings
         self.upstream: Any = None
         self._tasks: set[asyncio.Task] = set()
 
-        self.cache = cache or PriceCache(settings.redis_url)
         self.db = db or Database(
             settings.database_url,
             persist_rules=settings.rules_persistence_enabled,
@@ -56,12 +53,6 @@ class Services:
         self.connections = ConnectionManager(on_disconnect=self.subscriptions.disconnect)
         self.rule_store = RuleStore(repo=self.db)
         self.engine = RuleEngine(self.rule_store)
-        self.webhooks = webhooks or WebhookDispatcher(
-            settings.webhook_signing_secret,
-            max_attempts=settings.webhook_max_attempts,
-            timeout=settings.webhook_timeout_seconds,
-            retry_backoff=settings.webhook_retry_backoff_seconds,
-        )
 
     async def _up_subscribe(self, symbol: str) -> None:
         if self.upstream is not None:
@@ -80,9 +71,15 @@ class Services:
         """Ingestion path. Everything before the broadcast is non-blocking."""
         try:
             self.db.enqueue_tick(tick)
-            self._spawn(self.cache.set_price(tick))
             for rule, event in self.engine.evaluate(tick):
-                self.webhooks.dispatch(rule.webhook_url, event)
+                log.info(
+                    "rule fired: rule_id=%s symbol=%s type=%s threshold=%s price=%s",
+                    event.get("rule_id"),
+                    event.get("symbol"),
+                    event.get("rule_type"),
+                    event.get("threshold"),
+                    event.get("price"),
+                )
         except Exception:
             log.exception("tick side-effects failed")
         try:
@@ -111,24 +108,20 @@ class Services:
             await self.upstream.stop()
         for task in list(self._tasks):
             task.cancel()
-        await self.webhooks.close()
-        await self.cache.close()
         await self.db.close()
 
 
 def create_app(
     settings: Optional[Settings] = None,
     upstream_factory: Optional[UpstreamFactory] = None,
-    cache=None,
     db=None,
-    webhooks=None,
 ) -> FastAPI:
     settings = settings or get_settings()
     factory = upstream_factory or default_upstream_factory
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        services = Services(settings, cache=cache, db=db, webhooks=webhooks)
+        services = Services(settings, db=db)
         app.state.services = services
         await services.startup(factory)
         try:
