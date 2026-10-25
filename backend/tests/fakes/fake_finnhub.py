@@ -80,6 +80,7 @@ class FakeFinnhubClient:
         self.stop_calls = 0
         self.subscribed: list[str] = []
         self.unsubscribed: list[str] = []
+        self.connected = False
         FakeFinnhubClient.instances.append(self)
 
     @classmethod
