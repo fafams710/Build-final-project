@@ -46,3 +46,18 @@ export function wsUrl(): string {
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
   return `${scheme}://${window.location.host}/ws`;
 }
+
+export interface Alert {
+  id: string;
+  rule_id: string;
+  symbol: string;
+  rule_type: string;
+  threshold: number;
+  price: number;
+  triggered_at: number;
+}
+
+export async function listAlerts(limit = 50): Promise<Alert[]> {
+  const res = await check(await fetch(`${base}/api/alerts?limit=${limit}`));
+  return res.json();
+}

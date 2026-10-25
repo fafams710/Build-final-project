@@ -31,9 +31,16 @@ def client(settings, fake_db):
 
 
 @pytest.fixture
-def client_no_db(settings):
-    """Real Database with no URL: the app runs, rule endpoints answer 503."""
+def client_no_db():
+    """Explicit opt-out (RULES_PERSISTENCE_ENABLED=false) with the real
+    Database and no URL: the app runs, rule endpoints answer 503."""
     FakeFinnhubClient.instances.clear()
-    app = create_app(settings, upstream_factory=FakeFinnhubClient.factory)
+    opt_out = Settings(
+        _env_file=None,
+        finnhub_api_key="",
+        database_url="",
+        rules_persistence_enabled=False,
+    )
+    app = create_app(opt_out, upstream_factory=FakeFinnhubClient.factory)
     with TestClient(app) as c:
         yield c

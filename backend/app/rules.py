@@ -6,40 +6,32 @@ import time
 from collections import deque
 from typing import Any
 
-from .models import Rule, RuleCreate, RuleType, Tick
+from .models import Rule, RuleType, Tick
 
 log = logging.getLogger(__name__)
 
 
 class RuleStore:
     """In-memory copy of the rules used for evaluation. Postgres is the source
-    of truth; `repo` is only used to load rules at startup."""
+    of truth; `repo` is only used to load rules at startup, and a load
+    failure propagates (startup must fail loudly)."""
 
     def __init__(self, repo: Any = None) -> None:
         self._rules: dict[str, Rule] = {}
         self._repo = repo
 
     async def load(self) -> None:
-        """Load persisted rules; on any failure log and keep the store empty."""
+        """Load persisted rules; a repo failure propagates to the caller."""
         if self._repo is None:
             return
-        try:
-            for rule in await self._repo.load_rules():
-                self._rules[rule.id] = rule
-        except Exception as exc:
-            log.warning("loading persisted rules failed: %s", type(exc).__name__)
+        for rule in await self._repo.load_rules():
+            self._rules[rule.id] = rule
 
     def put(self, rule: Rule) -> None:
         self._rules[rule.id] = rule
 
     def discard(self, rule_id: str) -> None:
         self._rules.pop(rule_id, None)
-
-    async def add(self, data: RuleCreate) -> Rule:
-        """In-memory only helper (no persistence)."""
-        rule = Rule(**data.model_dump())
-        self.put(rule)
-        return rule
 
     def for_symbol(self, symbol: str) -> list[Rule]:
         return [r for r in self._rules.values() if r.symbol == symbol]

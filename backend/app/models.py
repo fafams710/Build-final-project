@@ -52,3 +52,15 @@ class RuleCreate(BaseModel):
 class Rule(RuleCreate):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     created_at: float = Field(default_factory=time.time)
+
+
+class Alert(BaseModel):
+    """A fired rule. Stores its own rule_type/threshold so it outlives the rule."""
+
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    rule_id: str
+    symbol: str
+    rule_type: str
+    threshold: float
+    price: float
+    triggered_at: float

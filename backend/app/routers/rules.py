@@ -3,6 +3,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 
+from ..db import WatchlistFull
 from ..models import Rule, RuleCreate, normalize_symbol
 
 log = logging.getLogger(__name__)
@@ -21,10 +22,15 @@ async def create_rule(data: RuleCreate, request: Request) -> Rule:
     services = request.app.state.services
     rule = Rule(**data.model_dump())
     try:
-        await services.db.save_rule(rule)
+        await services.db.create_rule_with_watchlist(
+            rule, services.settings.watchlist_max_symbols
+        )
+    except WatchlistFull:
+        raise HTTPException(status_code=409, detail="watchlist full")
     except Exception as exc:
         raise _unavailable("save", exc)
     services.rule_store.put(rule)
+    await services.watch_symbol(rule.symbol)
     return rule
 
 

@@ -35,10 +35,6 @@ class ConnectionManager:
             except Exception:
                 log.exception("on_disconnect callback failed")
 
-    @property
-    def connection_ids(self) -> list[str]:
-        return list(self._conns)
-
     def __len__(self) -> int:
         return len(self._conns)
 
@@ -56,10 +52,3 @@ class ConnectionManager:
         ids = list(conn_ids)
         if ids:
             await asyncio.gather(*(self._send_one(c, message) for c in ids))
-
-    async def broadcast(self, message: dict) -> None:
-        await self.send_to(self.connection_ids, message)
-
-    async def broadcast_symbol(self, subscriptions: Any, symbol: str, message: dict) -> None:
-        """Send to only the connections subscribed to `symbol` (assumption A1)."""
-        await self.send_to(subscriptions.subscribers(symbol), message)

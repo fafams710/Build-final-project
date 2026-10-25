@@ -16,7 +16,7 @@ class FakeWS:
         self.sent.append(msg)
 
 
-async def test_broadcast_reaches_all_and_drops_failed():
+async def test_send_to_drops_failed_connection():
     gone = []
 
     async def on_disc(cid):
@@ -28,12 +28,12 @@ async def test_broadcast_reaches_all_and_drops_failed():
     bid = await mgr.connect(bad)
     assert good.accepted and len(mgr) == 2
 
-    await mgr.broadcast({"x": 1})  # must not raise
+    await mgr.send_to([gid, bid], {"x": 1})  # must not raise
     assert good.sent == [{"x": 1}]
-    assert mgr.connection_ids == [gid]
+    assert len(mgr) == 1
     assert gone == [bid]
 
-    await mgr.broadcast({"x": 2})
+    await mgr.send_to([gid, bid], {"x": 2})
     assert good.sent == [{"x": 1}, {"x": 2}]
 
 
