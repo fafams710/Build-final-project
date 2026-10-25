@@ -1,0 +1,22 @@
+<implementation>
+  <iteration>3</iteration>
+  <files>
+    <file path="backend/app/db.py">list_rules and load_rules share new Database._build_rules (skip ValueError rows with WARNING id/symbol/error; LIMIT comment); _describe_error masks only full URL and userinfo ("user:pw@" -> "***@"), no bare-password replace.</file>
+    <file path="backend/tests/test_watchlist_alerts.py">4 new offline tests: list_rules skips malformed (stub pool), describe_error short password unchanged, URL/userinfo masked, percent-encoded userinfo masked.</file>
+    <file path="backend/tests/test_rules_postgres.py">1 new real-PG test: malformed rows inserted via SQL, GET /api/rules -> 200 with only valid rule, WARNING logged.</file>
+  </files>
+  <tests>
+    <test>Before the fix (tests written first): offline run 2 failed (list_rules skip test; short-password "does not e***ist" garble), 58 passed. The URL/userinfo mask tests were tightened to exact equality after that run; they pass on the new code. The real-PG GET /api/rules test was not run against old code (no stash allowed); old list_rules raised ValidationError on such a row, which is the stub-test failure.</test>
+    <test>After: offline 93 passed, 19 skipped. Real Postgres 17 (port 55503, trust, temp dir): 112 passed, 0 skipped.</test>
+  </tests>
+  <commands_run>
+    <command>python -X faulthandler -m pytest -o faulthandler_timeout=120 -q (offline, and with TEST_DATABASE_URL on throwaway PG17 cluster, stopped via pg_ctl and dir deleted)</command>
+  </commands_run>
+  <design_decisions>
+    <decision>Shared staticmethod _build_rules rather than duplicating skip logic in both methods.</decision>
+    <decision>Userinfo taken from urlsplit(url).netloc.rpartition("@")[0] (works with percent-encoded forms as written in the URL); rejected masking urlsplit().password, which is the bare-password replacement being removed.</decision>
+    <decision>Masked forms: full URL -> "***", "userinfo@" -> "***@". Order: URL first, then userinfo.</decision>
+  </design_decisions>
+  <blocked_reason>none</blocked_reason>
+  <self_critique>Real-PG test fail-before not executed on old code. A decoded (non-percent-encoded) password appearing alone in a message is intentionally no longer masked, per spec. The postgres.exe processes visible in tasklist belong to a pre-existing service (Services session), not my cluster, which was stopped and deleted.</self_critique>
+</implementation>

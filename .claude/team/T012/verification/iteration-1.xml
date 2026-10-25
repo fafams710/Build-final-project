@@ -1,0 +1,37 @@
+<verification>
+  <iteration>1</iteration>
+  <verdict>fail</verdict>
+  <criteria>
+    <criterion id="1">PASS - offline: 161 passed, 21 skipped. Real PG17 (port 55535, trust, temp dir in scratchpad): 182 passed, 0 skipped. Cluster stopped (pg_isready: no response) and data dir deleted.</criterion>
+    <criterion id="2">PASS - on the baseline copy (HEAD + tracked.diff + test_api_auth_coverage.py, old fakes) the new files fail: 27 of 31 tests in test_health_timeouts.py and both new real-PG tests (lock test, health ok-then-down). The 4 that passed on baseline: test_request_paths_503_on_timeout[query_timeout], [acquire_timeout], test_alert_writer_survives_timeouts_and_recovers, test_on_tick_does_not_wait_for_stuck_writer. Fine: they pin behaviour the old code already had (generic except Exception maps TimeoutError to 503; writers swallow failures; on_tick is queued). All pass now.</criterion>
+    <criterion id="3a">PASS - real uvicorn on 8791, fake Finnhub ws on 8792, no key: 200 {"status":"ok","database":"ok","upstream":"connected"}, exactly three keys.</criterion>
+    <criterion id="3b">PASS - fake ws killed: 200 {"status":"degraded","database":"ok","upstream":"disconnected"}; ws restarted: back to 200 ok/connected (within the first poll, under 1 s).</criterion>
+    <criterion id="3c">PASS - ACCESS EXCLUSIVE lock on alert_rules from another asyncpg session: GET /api/rules 503 {"detail":"rule storage unavailable"} in 5.05 s; /health during the lock answered 200 in 14 ms (server responsive); after rollback GET /api/rules 200.</criterion>
+    <criterion id="3d">PASS - pg_ctl stop -m immediate while server running: /health 503 {"status":"degraded","database":"down","upstream":"connected"} in 2.01 s (second call 2.01 s); /api/rules 503 in 4.1 s; after pg restart (pg_isready true after 1.8 s) /health returned 200 ok within 0.1 s of PG being ready.</criterion>
+    <criterion id="3e">PASS - RULES_PERSISTENCE_ENABLED=false, DATABASE_URL empty: starts in 1.5 s, /health 200 {"status":"ok","database":"disabled","upstream":"connected"} (upstream connected because a Finnhub key and fake ws were supplied).</criterion>
+    <criterion id="3f">FAIL (low) - startup against a stalled Postgres exits non-zero and bounded, no secrets in log, but the line is not the specified one. Lock held on alert_rules: exit code 3 after 6.6-7.2 s. Black-hole TCP listener (accepts, never answers) with a URL containing a sentinel password: exit 3 after 6.3 s, sentinel absent from log. Log lines: "app.db: database connect/setup failed: TimeoutError" then "app.main: startup failed: Postgres unavailable: TimeoutError; set RULES_PERSISTENCE_ENABLED=false to run without it". There is no "timed out" text and no 30 s path was reached: the 5 s command_timeout / create_pool timeout fires first inside Database.connect(), which swallows it into last_error, so the new 30 s wait_for branch ("Postgres setup timed out after 30s") is not reachable in either real-world stall tried. It only fires in the fake-DB unit tests. Fail-loud and no hang are met; the requested wording "startup failed: ... timed out" is not observed.</criterion>
+    <criterion id="3g">PASS - after the outage, POST /api/rules (AAPL price_above 100) returned 201, the fake ws tick (150) fired it, GET /api/alerts showed the new alert for that rule id (3 alert rows in total in the table); tick path and alert writer recovered.</criterion>
+    <criterion id="4">PASS - grep of db.py: all 12 pool.acquire sites pass timeout=DB_ACQUIRE_TIMEOUT_SECONDS, plus ping() uses HEALTH_DB_TIMEOUT_SECONDS; create_pool has command_timeout=DB_COMMAND_TIMEOUT_SECONDS; constants are 5.0 / 5.0 / 30.0 / 2.0 each with a one-line comment (db.py lines 56-63).</criterion>
+    <criterion id="5">PASS - git status --short lists exactly: db.py, main.py, routers/health.py, fakes/fake_db.py, fakes/fake_finnhub.py, test_auth.py, test_rules_postgres.py, test_watchlist_alerts.py (modified) and test_api_auth_coverage.py, test_health_timeouts.py (untracked). That is the impl file list plus the earlier T011 files; nothing else. (.claude/team files were not in the status output.)</criterion>
+  </criteria>
+  <test_results>
+    <result>cd backend; python -X faulthandler -m pytest -o faulthandler_timeout=120 -q -> 161 passed, 21 skipped</result>
+    <result>same with TEST_DATABASE_URL=postgresql://postgres@localhost:55535/t012test -> 182 passed, 0 skipped</result>
+    <result>baseline copy (scratchpad/base): new tests/test_health_timeouts.py + test_rules_postgres.py -> 29 failed, 23 passed (the 2 new PG tests and 27 health/timeout tests fail; list in criterion 2)</result>
+    <result>scratchpad/drv/drive.py (real uvicorn scenarios 3a-3e,3g) and drv/hole.py + 3f lock run -> results above; raw output in scratchpad/drive.out</result>
+  </test_results>
+  <runtime_check result="yes">
+    Real uvicorn (port 8791) with a local fake Finnhub ws (8792), throwaway PG17 on 55535. Scenarios 3a-3g driven and timed as above. Processes I started (uvicorn, fake ws, throwaway postgres PID 23308 and its children) were all stopped; remaining python PID 48660 and the Windows service postgres were not mine and untouched. Ports 8791/8792/55535/55600 are not listening.
+  </runtime_check>
+  <bugs>
+    <bug>
+      <description>Startup against a stalled Postgres (lock held, or TCP accept with no reply) exits non-zero in about 6-7 s with "startup failed: Postgres unavailable: TimeoutError; ..." rather than the specified "startup failed: ... timed out" line. The 30 s DB_STARTUP_TIMEOUT_SECONDS branch is unreachable in these stalls because Database.connect() swallows the 5 s command/connect timeout into last_error (spec ambiguity 6 anticipated only the wait_for cancel path). Behaviour is safe (fails loudly, bounded, no secret leakage); only the wording differs from what was requested.</description>
+      <reproduction>Create throwaway PG; in one session BEGIN; LOCK TABLE alert_rules IN ACCESS EXCLUSIVE MODE; then start uvicorn app.main:app with DATABASE_URL pointing at it. Or run scratchpad/drv/hole.py (listener on 55600 that never replies). Observe exit code 3 after about 6 s and the log lines above.</reproduction>
+      <severity>low</severity>
+      <owner>implementer</owner>
+    </bug>
+  </bugs>
+  <self_critique>
+    Not tested: the alert-writer/tick behaviour while the DB is locked (only after recovery), a hang between connect and DDL longer than 5 s per command (the only way to reach the 30 s limit), concurrent saturated-pool /health. The Windows timing numbers (5.05 s, 2.01 s) may differ on Linux/docker. The fake Finnhub ws is mine, not real Finnhub. Baseline copy ran with the pre-change fakes, as intended, but test_health_timeouts.py imports behaviour that did not exist so many failures are AttributeError-style rather than assertion failures. Overall FAIL is driven solely by the low-severity 3f wording item; everything else passed.
+  </self_critique>
+</verification>

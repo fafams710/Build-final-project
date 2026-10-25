@@ -1,0 +1,29 @@
+<implementation>
+  <iteration>2</iteration>
+  <files>
+    <file path="backend/app/db.py">Database.last_error_timed_out (reset per connect(); True when the caught exception is TimeoutError/asyncio.TimeoutError or asyncpg QueryCanceledError)</file>
+    <file path="backend/app/main.py">_load_state_unbounded: db unavailable + last_error_timed_out -> timed-out line (query/connect limit); TimeoutError during rule/watchlist load now logs the same line (was re-raised with no startup line); 30 s line reworded</file>
+    <file path="backend/tests/test_health_timeouts.py">4 new offline tests (acquire timeout, create_pool timeout, non-timeout wording, 30 s path)</file>
+    <file path="backend/tests/test_rules_postgres.py">1 new real-PG test: ACCESS EXCLUSIVE on alert_rules held while app starts</file>
+  </files>
+  <log_lines>
+    <line>startup failed: Postgres setup timed out (query/connect limit 5s); set RULES_PERSISTENCE_ENABLED=false to run without it</line>
+    <line>startup failed: Postgres setup timed out (startup limit 30s); set RULES_PERSISTENCE_ENABLED=false to run without it</line>
+    <line>unchanged non-timeout: startup failed: Postgres unavailable: OSError: ...; set RULES_PERSISTENCE_ENABLED=false ...</line>
+  </log_lines>
+  <tests>
+    <test>Fail-before (baseline-2 db.py/main.py + new tests, real PG17 port 55541): 4 failed (acquire, create_pool, 30 s path, real lock test; real lock test showed "Postgres unavailable: TimeoutError"), non-timeout wording tests passed (unchanged behaviour).</test>
+    <test>After: offline 165 passed, 22 skipped; real PG17 187 passed, 0 skipped.</test>
+  </tests>
+  <commands_run>
+    <command>pytest offline; pytest with TEST_DATABASE_URL on throwaway PG17 (initdb trust, temp dir outside repo, port 55541); pg_ctl stop, dir deleted, pg_isready confirms nothing listening; baseline copy in temp deleted</command>
+  </commands_run>
+  <design_decisions>
+    <decision>Flag on Database (last_error_timed_out) rather than parsing last_error text; read via getattr so FakeDatabase needs no change.</decision>
+    <decision>Limit shown is DB_COMMAND_TIMEOUT_SECONDS (5s) for all in-connect timeouts, including the 10 s create_pool wait_for backstop; one wording rather than separate connect limit.</decision>
+    <decision>Also converted TimeoutError in the rule/watchlist load path to the timed-out line, since a lock on a table hit there previously escaped with no startup line.</decision>
+    <decision>30 s line reworded from "after Ns" to "(startup limit Ns)" to parallel the other; existing test only checks "timed out".</decision>
+  </design_decisions>
+  <blocked_reason>none</blocked_reason>
+  <self_critique>Real black-hole TCP listener not re-driven with uvicorn; covered by offline create_pool timeout test. CLAUDE.md text for iteration 1 unchanged. A first attempt at git stash was denied by the harness and did not run; fail-before used a temp baseline copy instead.</self_critique>
+</implementation>

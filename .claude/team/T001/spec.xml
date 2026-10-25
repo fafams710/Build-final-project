@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<spec task_id="T001" title="API Price &amp; Stock Change Tracker">
+
+  <user_stories>
+    <story>As a dashboard user, I open the React app and see live stock prices update in real time without refreshing the page.</story>
+    <story>As a dashboard user, I can subscribe to one or more stock symbols and immediately receive their latest known price, then live tick updates as they arrive.</story>
+    <story>As a dashboard user, I can stop watching a symbol and the backend stops pushing updates for it to me.</story>
+    <story>As an operator, I can define a threshold rule (price above/below a value, or percentage move over a window) for a symbol so that when the condition is met, an external webhook is called automatically, without me polling anything.</story>
+    <story>As an operator, I need only one outbound connection to Finnhub regardless of how many browsers or symbols are active, because the free tier allows exactly one concurrent upstream websocket.</story>
+    <story>As a developer, I can run the full backend test suite with no network access and no real Finnhub/Redis/Postgres credentials, and it passes deterministically.</story>
+    <story>As a maintainer, every push/PR is automatically checked by CI (backend tests + frontend build/test) before merge, and no secret is ever committed to the repo.</story>
+  </user_stories>
+
+  <acceptance_criteria>
+    <criterion id="1">On FastAPI startup (lifespan "startup" phase), exactly one Finnhub websocket client connection is created. On shutdown (lifespan "shutdown" phase), that connection is closed. No code path outside the lifespan-managed client (e.g. no request handler) opens a Finnhub connection; a test asserts the upstream client is instantiated/connected exactly once for the app's lifetime even when multiple symbols/browsers are active.</criterion>
+    <criterion id="2">A ConnectionManager class tracks connected browser WebSocket objects, can broadcast a tick to all (or to the subset subscribed to that symbol — see Assumption A1), and removes a connection from its tracking set when the send fails or the socket disconnects, without raising an unhandled exception or crashing other connections' delivery.</criterion>
+    <criterion id="3">A SubscriptionManager ref-counts symbol interest across browser connections: subscribing a second browser to a symbol already subscribed by another browser does NOT send a second upstream "subscribe" message to Finnhub. Unsubscribing a symbol only sends an upstream "unsubscribe" message when its ref-count reaches zero.</criterion>
+    <criterion id="4">When a browser WebSocket disconnects without sending an explicit unsubscribe, the SubscriptionManager decrements ref-counts for every symbol that connection was subscribed to, applying the same zero-count unsubscribe rule as criterion 3.</criterion>
+    <criterion id="5">Subscribing to a symbol a connection is already subscribed to is idempotent: ref-count is not incremented twice and no duplicate upstream subscribe is sent.</criterion>
+    <criterion id="6">On successful subscribe, if Redis holds a cached last price for that symbol, the subscribing browser receives that cached value immediately (snapshot) before/independently of the next live tick.</criterion>
+    <criterion id="7">An API (REST and/or WS control message) lets a client create, list, and delete threshold rules (price-above, price-below, percent-change-over-window) scoped to a symbol; rules are held in an in-memory store that is the source of truth for real-time evaluation.</criterion>
+    <criterion id="8">Every incoming tick is evaluated against in-memory rules for its symbol. A rule fires only on the transition into the triggering condition (edge-triggered), not on every subsequent tick that still satisfies it, so a sustained breach does not spam duplicate webhooks (see Assumption A4).</criterion>
+    <criterion id="9">When a rule fires, the backend sends an HTTP POST (via httpx, async) to the rule's configured webhook URL with a JSON body describing the event, plus a header carrying an HMAC-SHA256 signature of the raw body computed with a secret from configuration. A test (fake webhook receiver) verifies the signature header is present and valid for the given secret and body.</criterion>
+    <criterion id="10">Webhook delivery failure (timeout, connection error, non-2xx) is caught, logged, and optionally retried up to a bounded number of attempts; it never raises out of the tick-processing path and never blocks ingestion of subsequent ticks.</criterion>
+    <criterion id="11">If rule persistence is enabled, created/updated/deleted rules are written to a Postgres table and reloaded into the in-memory store on startup; if the database is unavailable, rule CRUD and real-time evaluation still work in-memory and the error is logged rather than raised to the caller (see Assumption A5).</criterion>
+    <criterion id="12">Incoming ticks are asynchronously persisted to a TimescaleDB hypertable (symbol, price, volume/size if available, exchange timestamp, received timestamp) without blocking or measurably delaying the browser-facing broadcast path; persistence failures are logged and do not stop the live pipeline.</criterion>
+    <criterion id="13">All secrets and environment-specific values (FINNHUB_API_KEY, WEBHOOK_SIGNING_SECRET, DATABASE_URL, REDIS_URL, and any others introduced) are read only from environment variables / `.env`. A committed `.env.example` lists every required variable name with a placeholder (no real values). `.gitignore` excludes `.env` (and any local env files) from version control. A test or static check confirms no secret-shaped literal is hardcoded in source.</criterion>
+    <criterion id="14">`docker-compose.yml` at the project root defines `redis` and `timescaledb` (Postgres+TimescaleDB image) services with the ports/env needed for local backend development, plus backend and frontend services wired to them via environment variables.</criterion>
+    <criterion id="15">The backend pytest suite runs with no network access and without a real Finnhub connection: a fake upstream (in-process fake websocket server or a monkeypatched/injectable client emitting canned trade messages) stands in for Finnhub in all tests. `pytest` run from the backend project exits 0 with this fake in place and no live credentials.</criterion>
+    <criterion id="16">GitHub Actions CI (`.github/workflows/ci.yml`) runs on push and pull_request with at least two jobs: (a) backend job that starts `redis` and `timescaledb` as service containers, installs Python deps, and runs `pytest`; (b) frontend job that installs Node deps and runs the frontend build and frontend test command. The workflow fails (non-zero) if either job fails.</criterion>
+    <criterion id="17">The React frontend renders a dashboard that: lets the user add/remove watched symbols, displays updating prices for watched symbols received over a WebSocket connection to the backend, and provides a form to create alert rules via the backend rules API.</criterion>
+    <criterion id="18">Reconnection: if the single upstream Finnhub connection drops, the backend attempts to reconnect with backoff and re-sends subscribe messages for every symbol that currently has a non-zero ref-count, without requiring browsers to resubscribe.</criterion>
+  </acceptance_criteria>
+
+  <assumptions>
+    <assumption id="A1">Per-symbol fan-out: each browser WebSocket only receives tick messages for symbols it has subscribed to, not a global broadcast of every symbol being tracked by any client. This is the standard interpretation of "symbol subscription management" and keeps bandwidth proportional to each client's interest.</assumption>
+    <assumption id="A2">Market data provider is Finnhub via its public websocket (`wss://ws.finnhub.io`), auth via API key query param, using the `websockets` Python library for the upstream client (direct control over a single connection, as required) rather than an SDK.</assumption>
+    <assumption id="A3">Backend stack: FastAPI + Uvicorn, `redis` (async client) for the price cache, `asyncpg` for TimescaleDB/Postgres access, `httpx` (async) for outbound webhooks, `pytest` + `pytest-asyncio` for tests. Frontend: Vite + React, with Vitest + React Testing Library for frontend tests, built with `npm run build`.</assumption>
+    <assumption id="A4">"Volatility hit" rules are implemented as a percent-change-over-a-rolling-window check (e.g. price moved more than X% within the last N seconds/minutes), computed from either the in-memory last-seen price/time or cached Redis value plus current tick; exact window granularity is an implementation detail left to the builder as long as it is configurable per rule.</assumption>
+    <assumption id="A5">DB persistence of rules and ticks is "best effort": the in-memory rule store and the live broadcast/ingestion path are the source of truth and must keep working even if Postgres/TimescaleDB is down or slow; persistence is an added durability/history feature, not a hard dependency of the real-time path. Redis is similarly best-effort for snapshot-on-subscribe only, not required for ticks to flow.</assumption>
+    <assumption id="A6">A single shared `WEBHOOK_SIGNING_SECRET` env var is used to HMAC-sign all outgoing webhook payloads (per-rule secrets are out of scope unless trivial to add).</assumption>
+    <assumption id="A7">No authentication/authorization is required for the dashboard or its REST/WS API in this iteration (local/dev-focused build); this can be added later without changing this spec's scope.</assumption>
+    <assumption id="A8">Project files live directly under the existing project root (not inside a nested new folder), organized as `backend/` and `frontend/` subfolders plus root-level `docker-compose.yml`, `.env.example`, `.gitignore`, and `.github/workflows/ci.yml`.</assumption>
+  </assumptions>
+
+  <edge_cases>
+    <edge_case>Finnhub upstream connection drops or errors mid-session: must reconnect with backoff and resubscribe currently ref-counted symbols (criterion 18) without dropping/corrupting ref-counts.</edge_case>
+    <edge_case>Rapid subscribe/unsubscribe/resubscribe of the same symbol by overlapping browsers must not cause ref-count to go negative or leave a phantom upstream subscription after the last browser truly leaves.</edge_case>
+    <edge_case>A browser subscribes to a symbol with no Redis cache entry yet (first time ever tracked): it simply waits for the next live tick, no error raised.</edge_case>
+    <edge_case>A rule's webhook endpoint is slow or unreachable: delivery must not block or slow down tick ingestion/broadcast for any symbol.</edge_case>
+    <edge_case>Redis is down when a subscribe happens: snapshot step is skipped/logged, live ticks still flow once they arrive.</edge_case>
+    <edge_case>Postgres/TimescaleDB is down at startup or during operation: app still starts and serves real-time data; persistence operations fail silently into logs (not exceptions surfaced to the client).</edge_case>
+    <edge_case>A rule condition remains true across many consecutive ticks (sustained breach): only one webhook fires per crossing (edge-triggered per criterion 8), re-arming only after the condition becomes false again (or per a defined cooldown), to avoid webhook spam.</edge_case>
+    <edge_case>Invalid/unknown symbol subscribed by a browser: backend forwards the subscribe to Finnhub as requested; if Finnhub never sends data for it, the browser simply receives no ticks for that symbol (no crash).</edge_case>
+    <edge_case>Multiple rules on the same symbol with different thresholds: each is evaluated and can fire independently on the same tick.</edge_case>
+    <edge_case>Server restarts: in-memory rules are empty until reloaded from DB (if persistence enabled) or recreated by clients; in-memory ref-counts start at zero and browsers must resubscribe after reconnecting their WebSocket.</edge_case>
+  </edge_cases>
+
+  <risks>
+    <risk severity="high">The single-upstream-connection constraint is the core architectural risk: any bug in ref-counting or reconnect logic can either exceed Finnhub's one-connection limit (causing Finnhub to reject/kill the connection) or silently stop delivering data for symbols still wanted by active browsers.</risk>
+    <risk severity="medium">A fake/mocked Finnhub upstream in tests may not faithfully reproduce real Finnhub message framing, auth handshake, or error/close behavior, so passing tests do not guarantee correct behavior against the live Finnhub websocket.</risk>
+    <risk severity="medium">Edge-triggered rule firing (criterion 8) is an assumption (A4) about desired alerting semantics; if the real intent was "fire every tick while condition holds" or "fire once then auto-delete the rule," behavior will not match expectations.</risk>
+    <risk severity="low">HMAC webhook signing has no standardized header name specified by the request; an arbitrary but documented header/scheme is used, which downstream webhook consumers must be told about separately.</risk>
+    <risk severity="low">TimescaleDB-specific features (hypertables) require the Timescale extension to be enabled in the Postgres service image/init script; if the compose image or init SQL is misconfigured, persistence tests could pass locally but fail in CI's service container or vice versa.</risk>
+  </risks>
+
+  <dependencies>
+    <dependency>Finnhub websocket API and a valid FINNHUB_API_KEY (external, not used in automated tests — only in real/manual runs).</dependency>
+    <dependency>Python packages: fastapi, uvicorn, websockets, httpx, redis (async client), asyncpg, pydantic / pydantic-settings, pytest, pytest-asyncio.</dependency>
+    <dependency>Node/npm packages: react, vite, vitest, @testing-library/react (or equivalent) for the frontend.</dependency>
+    <dependency>Docker + docker-compose for local Redis and TimescaleDB (and optionally backend/frontend) services.</dependency>
+    <dependency>GitHub Actions runner with service containers for redis and a TimescaleDB-capable Postgres image.</dependency>
+  </dependencies>
+
+  <file_list>
+    <file>.env.example</file>
+    <file>.gitignore</file>
+    <file>docker-compose.yml</file>
+    <file>.github/workflows/ci.yml</file>
+    <file>backend/app/__init__.py</file>
+    <file>backend/app/main.py</file>
+    <file>backend/app/config.py</file>
+    <file>backend/app/connection_manager.py</file>
+    <file>backend/app/finnhub_client.py</file>
+    <file>backend/app/subscription_manager.py</file>
+    <file>backend/app/redis_cache.py</file>
+    <file>backend/app/db.py</file>
+    <file>backend/app/models.py</file>
+    <file>backend/app/rules.py</file>
+    <file>backend/app/webhooks.py</file>
+    <file>backend/app/routers/__init__.py</file>
+    <file>backend/app/routers/symbols.py</file>
+    <file>backend/app/routers/rules.py</file>
+    <file>backend/app/routers/ws.py</file>
+    <file>backend/app/routers/health.py</file>
+    <file>backend/requirements.txt</file>
+    <file>backend/Dockerfile</file>
+    <file>backend/pytest.ini</file>
+    <file>backend/tests/__init__.py</file>
+    <file>backend/tests/conftest.py</file>
+    <file>backend/tests/fakes/fake_finnhub.py</file>
+    <file>backend/tests/test_connection_manager.py</file>
+    <file>backend/tests/test_subscription_manager.py</file>
+    <file>backend/tests/test_rules_engine.py</file>
+    <file>backend/tests/test_webhooks.py</file>
+    <file>backend/tests/test_api_symbols.py</file>
+    <file>backend/tests/test_api_rules.py</file>
+    <file>frontend/package.json</file>
+    <file>frontend/vite.config.ts</file>
+    <file>frontend/index.html</file>
+    <file>frontend/src/main.tsx</file>
+    <file>frontend/src/App.tsx</file>
+    <file>frontend/src/api/client.ts</file>
+    <file>frontend/src/hooks/useWebSocket.ts</file>
+    <file>frontend/src/components/Dashboard.tsx</file>
+    <file>frontend/src/components/SymbolSubscribe.tsx</file>
+    <file>frontend/src/components/PriceTicker.tsx</file>
+    <file>frontend/src/components/RuleForm.tsx</file>
+    <file>frontend/src/components/RuleList.tsx</file>
+    <file>frontend/tests/Dashboard.test.tsx</file>
+    <file>frontend/Dockerfile</file>
+  </file_list>
+
+  <self_critique>
+    Every user story maps to at least one acceptance criterion: live prices -> 2,6,17; subscribe/unsubscribe -> 3,4,5,6,17; threshold webhooks -> 7,8,9,10; single-upstream constraint -> 1,3,18; offline tests -> 15; CI/secrets -> 13,14,16.
+    Each criterion is observable: either by direct unit/integration test (ref-count behavior, signature header, retry-not-blocking, fake-upstream pytest run) or by inspecting committed files (.env.example, .gitignore, docker-compose.yml, ci.yml contents and job definitions). None depend on subjective judgment.
+    Biggest residual uncertainty: whether ticks should fan out to all connected browsers or only to those subscribed to that specific symbol (Assumption A1), and the exact alert-firing cadence (edge-triggered vs. every-tick vs. fire-once-then-disable, Assumption A4). Both were treated as assumable rather than blocking because a reasonable, clearly-stated default exists and the overall architecture (lifespan singleton upstream, ref-counted subscriptions, in-memory rules, HMAC webhooks) is unaffected by which choice is made — an implementer or reviewer can flip either behavior later with a small, localized change if the assumption turns out wrong.
+  </self_critique>
+
+</spec>

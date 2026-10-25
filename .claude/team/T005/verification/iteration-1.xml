@@ -1,0 +1,32 @@
+<verification>
+  <iteration>1</iteration>
+  <verdict>pass</verdict>
+  <criteria>
+    <criterion id="1">met - 33 passed, 6 skipped; reason "TEST_DATABASE_URL not set; real-Postgres tests skipped"</criterion>
+    <criterion id="2">met - throwaway PG17, 39 passed, 0 skipped</criterion>
+    <criterion id="3">met - live POST returned 201 with keys symbol,type,threshold,window_seconds,id,created_at, symbol uppercased (memory insertion covered by tests)</criterion>
+    <criterion id="4">met - no-DB POST 503 body {"detail":"rule storage unavailable"} (no URL/credentials); memory-unchanged covered by passing tests</criterion>
+    <criterion id="5">met - GET order newest first, limit=1 returns newest, limit=0/501/abc 422, symbol filter works, DB stopped/no DB 503</criterion>
+    <criterion id="6">met - DELETE 204 then 404; 503 when no DB</criterion>
+    <criterion id="7">met - no DB: /health 200, POST/GET/DELETE 503</criterion>
+    <criterion id="8">partially observed live (new uvicorn process returned the rules persisted by earlier process); engine firing after reload covered by the passing real-DB tests</criterion>
+    <criterion id="9">met - old table with webhook_url NOT NULL: after startup column absent, GET returned old1 row, new POST 201</criterion>
+    <criterion id="10">met via tests passing</criterion>
+    <criterion id="11">met - uvicorn started with no DB and with DB stopped mid-run without crashing</criterion>
+    <criterion id="12">met - on_tick calls sync db.enqueue_tick; no await on Postgres</criterion>
+    <criterion id="13">met - ci.yml pytest step sets TEST_DATABASE_URL to service container; frontend build and npm test (2 passed) pass</criterion>
+    <criterion id="14">met - tests offline with fake Finnhub; real-DB fixture resets tables</criterion>
+  </criteria>
+  <test_results>
+    <result>pytest, TEST_DATABASE_URL unset -> 33 passed, 6 skipped</result>
+    <result>pytest, TEST_DATABASE_URL=PG17 throwaway on port 55433 -> 39 passed, 0 skipped</result>
+    <result>npm run build -> ok; npm test -> 2 passed</result>
+  </test_results>
+  <runtime_check result="yes">
+    Ran uvicorn with no DATABASE_URL (health 200; rules endpoints 503), then against a throwaway PG17 cluster (two POSTs, GET order, limit, 422s, symbol filter, separate new process still returns rules, DELETE 204/404, Postgres stopped -> POST 503 and /health 200), then against an old-schema DB (column dropped, row kept, POST ok). Cluster stopped and data dir removed; nothing left in repo.
+  </runtime_check>
+  <bugs></bugs>
+  <self_critique>
+    The "restart" was done by launching a fresh uvicorn process on another port while the earlier one was still running (pkill unavailable), not a kill-then-restart on the same port. Engine firing after reload not driven live. ci.yml was read, not YAML-parsed with a tool; its structure is plain. Windows PG17 used, not Linux PG16.
+  </self_critique>
+</verification>

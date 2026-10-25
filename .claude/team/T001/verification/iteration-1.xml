@@ -1,0 +1,44 @@
+<verification>
+  <iteration>1</iteration>
+  <verdict>pass</verdict>
+  <criteria>
+    <criterion id="1">met - e2e run: real FinnhubClient (websockets.connect) against a local fake server; exactly 1 upstream connection with 2 browsers; closed on uvicorn shutdown. Client created only in lifespan (Services.startup). Unit test also asserts single start/stop.</criterion>
+    <criterion id="2">met - pytest test_connection_manager passes; e2e fan-out delivered to subscribed sockets; disconnect handled.</criterion>
+    <criterion id="3">met - e2e: two browsers subscribe AAPL, upstream received exactly one subscribe; after first unsubscribe no upstream unsubscribe; unsubscribe sent only after last left.</criterion>
+    <criterion id="4">met - e2e: browser b closed without unsubscribe, upstream unsubscribe AAPL sent (see bug 1 for delay when Redis is down).</criterion>
+    <criterion id="5">met - e2e: duplicate subscribe from browser a produced no extra upstream message.</criterion>
+    <criterion id="6">met by unit/app tests only (snapshot test passes with fake cache); not verified against real Redis.</criterion>
+    <criterion id="7">met - POST/GET /api/rules returned 201 and list of 1 live; delete covered by pytest.</criterion>
+    <criterion id="8">met - e2e: ticks 99,101,102,103 against price_above 100 produced exactly 1 webhook.</criterion>
+    <criterion id="9">met - e2e receiver got POST with X-Signature-256 = sha256=HMAC(secret, raw body); recomputed and matched (True).</criterion>
+    <criterion id="10">met - pytest retry/non-blocking tests pass; not exercised against slow live endpoint in e2e.</criterion>
+    <criterion id="11">partially observed - with DB unreachable the app started, logged "database unavailable", rule CRUD and evaluation worked in memory. Real Postgres load/save not tested.</criterion>
+    <criterion id="12">partially observed - with DB unreachable ticks still flowed and broadcast; real hypertable writes/SQL not tested (no TimescaleDB).</criterion>
+    <criterion id="13">met - .gitignore has .env, .env.*, !.env.example; .env.example has placeholders only; no .env file in tree; static secret scan test passes within the 27.</criterion>
+    <criterion id="14">met by static inspection - docker-compose.yml defines redis, timescaledb, backend, frontend. Not run (docker not exercised).</criterion>
+    <criterion id="15">met - python -m pytest -q: 27 passed, offline, no credentials.</criterion>
+    <criterion id="16">met by static inspection - ci.yml on push and pull_request, backend job with redis + timescaledb services and pytest, frontend job with npm install, build, test. Not run on GitHub.</criterion>
+    <criterion id="17">met - npm run build succeeds; vitest 2 passed (subscribe/tick/remove, rule create). Not driven in a real browser.</criterion>
+    <criterion id="18">met - e2e: upstream connection force-closed; client reconnected with backoff (1 new connection) and resent subscribe for the active symbol (MSFT) without browser action.</criterion>
+  </criteria>
+  <test_results>
+    <result>cd backend; python -m pytest -q -> 27 passed, 1 warning (starlette httpx deprecation)</result>
+    <result>cd frontend; npm run build -> success (37 modules)</result>
+    <result>cd frontend; npm test -> 1 file, 2 tests passed</result>
+    <result>scratchpad e2e.py (real uvicorn + real FinnhubClient to local fake ws server + local webhook receiver, Redis and DB unreachable) -> all observations above</result>
+  </test_results>
+  <runtime_check result="yes">
+    Booted the FastAPI app under uvicorn with Redis and Postgres URLs pointing at closed ports. /health returned ok; created a price_above rule via REST; two real websocket browser clients subscribed; fake upstream pushed trade frames; verified fan-out, edge-triggered single signed webhook, ref-counted single upstream subscribe/unsubscribe, disconnect cleanup, upstream drop/reconnect/resubscribe, and clean shutdown.
+  </runtime_check>
+  <bugs>
+    <bug>
+      <description>With Redis unreachable, each browser subscribe blocks the websocket handler for the redis socket timeout (about 2s) in cache.get_price, so later control messages on that socket, including disconnect cleanup of an in-flight handler, are delayed and the upstream unsubscribe lagged ~2s+. Functionally correct but slow degradation; ticks are unaffected.</description>
+      <reproduction>Run app with REDIS_URL=redis://127.0.0.1:1/0, connect a ws client, send subscribe then close immediately; upstream unsubscribe arrives only after the redis timeout (scratchpad e2e.py with sleep 0.5 after b.close()).</reproduction>
+      <severity>low</severity>
+      <owner>implementer</owner>
+    </bug>
+  </bugs>
+  <self_critique>
+    Not tested: real Redis, real asyncpg/TimescaleDB (SQL, hypertable creation, persistence reload), real Finnhub framing/auth, docker-compose up, GitHub Actions execution, a real browser. Fake upstream was a local websockets server, which is more faithful than the in-process stub but still not Finnhub. Python 3.13 locally vs 3.12 in CI. CI runs pytest with DATABASE_URL/REDIS_URL set to live service containers, a path not exercised here. Percent-change rule only covered by pytest, not e2e.
+  </self_critique>
+</verification>

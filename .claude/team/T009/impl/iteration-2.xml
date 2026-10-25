@@ -1,0 +1,52 @@
+<implementation>
+  <iteration>2</iteration>
+  <files>
+    <file path="docker-compose.yml">postgres healthcheck now pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-ticks} (TCP); nothing else touched in this iteration</file>
+    <file path="backend/app/db.py">Database.last_error (type: message, URL and password scrubbed to ***; "DATABASE_URL is empty" for empty URL); connect log reworded; load_rules builds each Rule separately and skips bad rows with WARNING; backfill logs a WARNING for skipped symbols</file>
+    <file path="backend/app/main.py">_load_state: unavailable-DB log names db.last_error; load failure log includes type AND message plus the RULES_PERSISTENCE_ENABLED=false hint; watchlist symbols normalized one by one, bad ones skipped with WARNING</file>
+    <file path="backend/tests/fakes/fake_db.py">added last_error attribute (None) so Services can read it</file>
+    <file path="backend/tests/test_watchlist_alerts.py">7 new offline tests (stub pool for Database, FakeDatabase)</file>
+    <file path="backend/tests/test_rules_postgres.py">1 new real-Postgres test: malformed alert_rules and watchlist rows inserted via SQL</file>
+  </files>
+  <backfill_before>
+    _backfill_watchlist already wrapped normalize_symbol in try/except ValueError and `continue`d, so an invalid symbol was NOT copied into the watchlist, but it was skipped silently (no log). Now it logs a WARNING (message: backfill: skipping invalid rule symbol 'X' (not added to watchlist)). No behaviour change otherwise. Note backfill works per symbol, so a valid symbol on a rule with an invalid type/threshold is still backfilled.
+  </backfill_before>
+  <what_is_rejected>
+    normalize_symbol: strip+upper, must match ^[A-Z0-9][A-Z0-9.:_\-]{0,31}$ (so spaces, '!', empty, over 32 chars, leading '.' rejected) -> ValueError("invalid symbol").
+    Rule (RuleCreate): same symbol check; type must be price_above/price_below/percent_change; threshold must be > 0; window_seconds must be > 0 if given; percent_change requires window_seconds. All raise pydantic ValidationError (a ValueError). Real-PG test rows used: symbol 'bad symbol!', type 'nope', threshold -1.
+  </what_is_rejected>
+  <evidence>
+    Before implementation (tests written first): offline tests/test_watchlist_alerts.py -> 7 failed, 49 passed (all 7 new tests failed: no last_error attr, ValidationError not skipped, etc). Real PG tests/test_rules_postgres.py -> 1 failed (new test; log "startup failed: loading rules/watchlist: ValidationError"), 17 passed.
+    After implementation: offline full suite 89 passed, 18 skipped (the skips are the real-PG tests). Real PG (throwaway PG17 cluster, port 55497, trust auth, temp dir outside repo) full suite: 107 passed, 0 skipped. Cluster stopped (pg_ctl stop) and directory deleted; no python/postgres process of mine remains (a pre-existing pg_ctl.exe PID 4696 in the Services session is not mine).
+    One test-side fix during the run: my first real-PG test asserted wrongly (MSFT is legitimately backfilled from the invalid-type rules since its symbol is valid; and SQL ORDER BY collation placed 'bad symbol!' between AAPL and MSFT, so I compare sorted in Python).
+  </evidence>
+  <log_lines>
+    db.py ERROR: "database connect/setup failed: %s" with last_error, e.g. "database connect/setup failed: ConnectionRefusedError: [Errno ...] ..." (was "database unavailable, persistence disabled: <Type>")
+    db.py WARNING: "skipping malformed rule row id=%s symbol=%s: %s" (id, symbol, pydantic error text)
+    db.py WARNING: "backfill: skipping invalid rule symbol %r (not added to watchlist)"
+    main.py ERROR: "startup failed: Postgres unavailable: %s; set RULES_PERSISTENCE_ENABLED=false to run without it" (%s = db.last_error, or "unknown error")
+    main.py ERROR: "startup failed: loading rules/watchlist: %s: %s; set RULES_PERSISTENCE_ENABLED=false to run without it" (type, message)
+    main.py WARNING: "skipping malformed watchlist symbol %r"
+  </log_lines>
+  <tests>
+    Offline (test_watchlist_alerts.py): load_rules skips 3 malformed rows with 3 WARNINGs and loads valid ones; startup with stub pool skips bad rule + bad watchlist symbol and warns; startup with FakeDatabase skips bad watchlist symbol; load_rules query error still fails startup and message is logged; startup failure log names last_error and keeps the hint; empty URL sets "DATABASE_URL is empty"; real refused connection logs type+message, never the URL/password. All pass.
+    Real PG (test_rules_postgres.py): malformed alert_rules (bad symbol, bad type, negative threshold) and watchlist symbol via SQL; startup succeeds, only valid rules/symbols load, skipped rows remain in Postgres. Passes. Totals: 89 passed/18 skipped offline, 107 passed/0 skipped with PG.
+  </tests>
+  <commands_run>
+    python -X faulthandler -m pytest -o faulthandler_timeout=120 (offline, and with TEST_DATABASE_URL on port 55497); initdb/pg_ctl start/stop for the throwaway cluster. No git commands that change state were run.
+  </commands_run>
+  <design_decisions>
+    Scrub the DATABASE_URL and its parsed password from the stored/logged error text (replace with ***) instead of trusting asyncpg messages; cheap and covers invalid-DSN errors.
+    Catch ValueError (pydantic ValidationError subclass) for bad rows rather than all Exception, so real DB/query errors still fail startup.
+    Offline bad-rule test uses a small stub pool under the real Database (FakeDatabase holds already-validated Rule objects and cannot represent a bad row); bad watchlist symbol also tested with FakeDatabase.
+    Empty-URL connect keeps its early return (sets last_error) rather than raising; callers decide via available.
+    Services reads last_error via getattr so a db object without it still works.
+  </design_decisions>
+  <blocked_reason>none</blocked_reason>
+  <deviations>
+    Added last_error to tests/fakes/fake_db.py (not listed in the request but required for the offline test of the real-cause log). Rule load failure line also gained the RULES_PERSISTENCE_ENABLED=false hint (request said keep the hint; it was only on the unreachable line before). Skipped rules are logged inside Database.load_rules, so RuleStore.load is unchanged.
+  </deviations>
+  <self_critique>
+    Pydantic error text in the rule WARNING is multi-line and includes the input value; fine for logs but verbose. The password scrub only covers the exact URL and the parsed password string; an error echoing a percent-encoded form would not be scrubbed (asyncpg does not do that). A malformed list_rules row (API read) still raises, out of scope.
+  </self_critique>
+</implementation>

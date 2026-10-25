@@ -1,0 +1,264 @@
+<spec>
+  <summary>
+    M3: GET /health reports real database and upstream state. M8: every database operation is time-bounded
+    (5 s query, 5 s connection acquire, 30 s overall startup) and a timeout in a request path is a 503, never a 500.
+    Constants only, no new settings. No git state changes; CLAUDE.md is updated by the orchestrator (text at the end).
+  </summary>
+
+  <user_stories>
+    - As an operator or load balancer, I can call /health and learn whether Postgres and the Finnhub upstream are
+      actually working, not just that the process is alive.
+    - As an API client, a stuck or locked database makes my rules/alerts request fail fast with 503 instead of hanging.
+    - As an operator, a Postgres that accepts connections but never finishes startup work makes the app exit with a
+      clear "startup failed: ... timed out" line instead of hanging forever.
+    - As a user, price ingestion keeps flowing while the database is slow or stuck.
+  </user_stories>
+
+  <design>
+    <constants where="backend/app/db.py, module level, one-line comment each, no Settings/.env entries">
+      DB_COMMAND_TIMEOUT_SECONDS = 5.0   (per-query limit, passed as command_timeout to asyncpg.create_pool)
+      DB_ACQUIRE_TIMEOUT_SECONDS = 5.0   (max wait to get a pooled connection; passed as timeout= to every pool.acquire)
+      DB_STARTUP_TIMEOUT_SECONDS = 30.0  (one overall limit for connect + DDL + backfill + load rules + load watchlist)
+      HEALTH_DB_TIMEOUT_SECONDS = 2.0    (limit for the /health SELECT 1 probe, covers acquire and query)
+      The HEALTH constant is the "about 2 s" from the request; it is a fourth named constant, still no setting.
+    </constants>
+
+    <acquire_call_sites>
+      Every pool.acquire() in db.py gets timeout=DB_ACQUIRE_TIMEOUT_SECONDS (12 existing sites): connect (schema DDL),
+      _tick_worker, save_rule, delete_rule, list_rules, load_rules, create_rule_with_watchlist, load_watchlist,
+      _backfill_watchlist, _write_alert_rows (batch attempt AND the row-by-row retry), list_alerts.
+      The new probe (below) is the 13th site and uses HEALTH_DB_TIMEOUT_SECONDS instead. Constants are read at call
+      time (module-global lookup) so tests can monkeypatch app.db.&lt;NAME&gt;. asyncpg.create_pool gets
+      command_timeout=DB_COMMAND_TIMEOUT_SECONDS in addition to the existing min/max/timeout arguments (the existing
+      create_pool connect timeout=5 and outer wait_for 10 are left as they are).
+    </acquire_call_sites>
+
+    <timeout_exceptions>
+      asyncpg raises asyncio.TimeoutError for a command_timeout expiry, and asyncio.TimeoutError for an acquire
+      timeout (on Python 3.11+ this is the builtin TimeoutError). Both derive from Exception, so the existing
+      `except Exception` blocks in routers/rules.py (_unavailable) and routers/alerts.py already map them to 503
+      "rule storage unavailable" / "alert storage unavailable". No router code change is required; the requirement is
+      that this stays true and is covered by tests. CancelledError is not an Exception and must not be swallowed.
+      Routers log only the exception type (existing behaviour); a timeout logs "TimeoutError".
+      Writers: _tick_worker and _write_alert_rows already catch Exception, so a timeout is a failed write (tick:
+      logged and dropped; alert: failed batch, row retry, ALERT_FAILURE_BACKOFF_SECONDS sleep). No change needed
+      beyond the new timeouts; Services.on_tick stays non-blocking.
+    </timeout_exceptions>
+
+    <startup>
+      Services._load_state wraps its whole body (db.connect(), the persistence-disabled early return, the
+      available check, rule_store.load(), db.load_watchlist()) in one asyncio.wait_for with
+      DB_STARTUP_TIMEOUT_SECONDS, read through the db module at call time (e.g. `from . import db as db_module`)
+      so tests can patch app.db.DB_STARTUP_TIMEOUT_SECONDS. On asyncio.TimeoutError, log at ERROR exactly one line
+      beginning "startup failed:" and containing "timed out" and "RULES_PERSISTENCE_ENABLED=false", e.g.
+      "startup failed: Postgres setup timed out after 30s; set RULES_PERSISTENCE_ENABLED=false to run without it"
+      (seconds printed from the constant), then re-raise (any exception type, e.g. RuntimeError). The line contains no
+      exception text, URL, or credential. The existing Services.startup except-branch (db.close(), upstream never
+      started) is reused unchanged, so the pool and workers are released. The existing handler for load errors
+      (which interpolates the exception text) must not be the one that handles timeouts: handle TimeoutError first.
+      A TimeoutError raised from inside a query (command_timeout) during load_rules/load_watchlist is also reported
+      with the same "timed out" line. The opt-out path (persistence false) is subject to the same wrapper but returns
+      immediately.
+    </startup>
+
+    <health>
+      Response model: exactly three body keys {"status","database","upstream"}; no other fields, no messages, no URLs.
+      Router: routers/health.py reads request.app.state.services (same access pattern as the other routers); /health
+      stays on `app` outside the /api key-protected router (tests/test_api_auth_coverage.py still passes).
+      database:
+        "disabled" = settings.rules_persistence_enabled is False (explicit opt-out). Not a failure; no probe is made.
+        "ok"       = flag true and a probe succeeded: a new Database.ping() (async, returns bool) acquires a
+                     connection (HEALTH_DB_TIMEOUT_SECONDS) and runs SELECT 1 bounded by the same limit.
+        "down"     = flag true and the probe fails, times out, or raises anything (Exception), OR flag true and there is
+                     no pool (db.available is False). The no-pool case cannot occur after a successful fail-loud start;
+                     it is defined as "down" because persistence is required but unusable.
+        ping() never raises (except CancelledError), returns False when _pool is None, and logs at most the exception
+        type name (no message).
+      upstream:
+        "disabled"     = services.upstream is None (no Finnhub key).
+        "connected"    = upstream.connected is True.
+        "disconnected" = upstream exists and connected is not True.
+      status: "ok" when database in (ok, disabled) and upstream in (connected, disabled); otherwise "degraded".
+      HTTP: 503 when database == "down" (body still the same three fields, status "degraded"); otherwise 200 (including
+      upstream disconnected, status "degraded").
+      Health uses db.ping(), not db.available, because available only means "a pool object exists".
+    </health>
+
+    <test_doubles>
+      FakeDatabase (tests/fakes/fake_db.py): add `async def ping(self) -> bool` returning `not self.failing` and,
+      optionally, raising/awaiting forever per a settable attribute (e.g. ping_error / ping_hang) so the router-level
+      time bound can be tested. FakeFinnhubClient (tests/fakes/fake_finnhub.py): add a public `connected` attribute
+      (default False) so health tests can set True.
+    </test_doubles>
+  </design>
+
+  <acceptance_criteria>
+    <criterion n="1" test="offline, TestClient + FakeDatabase + FakeFinnhubClient with connected=True">
+      GET /health with no API key returns 200 and exactly {"status":"ok","database":"ok","upstream":"connected"}.
+    </criterion>
+    <criterion n="2" test="offline; FakeDatabase(failing=True) set after startup, and separately a ping that raises, and a ping that never returns with HEALTH_DB_TIMEOUT_SECONDS patched to 0.05">
+      Database failure, exception, or timeout: HTTP 503, body database "down", status "degraded", still only three
+      keys; the hanging case returns within a bounded time (assert elapsed under ~1 s).
+    </criterion>
+    <criterion n="3" test="offline, existing client_no_db fixture (rules_persistence_enabled=False, no Finnhub key)">
+      Opt-out: HTTP 200, database "disabled", upstream "disabled", status "ok". No probe is attempted (FakeDatabase
+      ping call count stays 0 in an equivalent fake-db variant).
+    </criterion>
+    <criterion n="4" test="offline, parametrised over upstream states with DB ok">
+      upstream "connected" -> 200/status ok; "disconnected" (connected False) -> 200/status "degraded"; "disabled"
+      (upstream None) -> 200/status "ok".
+    </criterion>
+    <criterion n="5" test="offline">
+      Only database "down" yields non-200: assert status code across all (database x upstream) combinations equals 503
+      iff database == "down".
+    </criterion>
+    <criterion n="6" test="offline, assert on response text and caplog">
+      /health body and logs contain no exception message, URL, password, or API key even when ping raises an
+      exception whose message contains a secret-looking string. (Body keys exactly the three.)
+    </criterion>
+    <criterion n="7" test="offline, real Database with persistence enabled and _pool=None, not started via lifespan or via a fake factory">
+      Flag true but no pool: Database.ping() is False and the health route reports database "down", 503.
+    </criterion>
+    <criterion n="8" test="offline, grep/inspect via test that monkeypatches a recording stub pool">
+      Every pool.acquire() made by Database rule/alert/watchlist/tick/backfill/connect paths is called with
+      timeout=DB_ACQUIRE_TIMEOUT_SECONDS (recording stub pool asserts the kwarg for save_rule, delete_rule, list_rules,
+      load_rules, create_rule_with_watchlist, load_watchlist, list_alerts, _write_alert_rows batch and per-row,
+      _tick_worker, _backfill_watchlist). asyncpg.create_pool is called with command_timeout=
+      DB_COMMAND_TIMEOUT_SECONDS (patch asyncpg.create_pool with a recording stub).
+    </criterion>
+    <criterion n="9" test="offline, stub pool whose connection method awaits Event().wait(); patch DB_COMMAND_TIMEOUT or have the stub raise asyncio.TimeoutError; patch constants small so the test is fast">
+      Request path, command timeout: POST/GET/DELETE /api/rules and GET /api/alerts each return 503 (never 500)
+      within the patched limit; rule_store unchanged on failed POST/DELETE.
+    </criterion>
+    <criterion n="10" test="offline, stub pool whose acquire() raises asyncio.TimeoutError (and a variant that blocks, wrapped by the real timeout kwarg via an asyncpg-like stub)">
+      Request path, acquire timeout: the same four endpoints return 503.
+    </criterion>
+    <criterion n="11" test="offline, extends the existing _failing_start helper in test_watchlist_alerts.py: FakeDatabase whose connect() or load_rules() awaits forever; patch app.db.DB_STARTUP_TIMEOUT_SECONDS to 0.1">
+      Startup overall timeout: lifespan raises (app does not start), exactly one ERROR record starting with "startup
+      failed:" and containing "timed out", no upstream started (FakeFinnhubClient.instances empty), db.close_calls == 1,
+      and the log text contains none of the DATABASE_URL / password (use a Settings with a URL containing a
+      sentinel password).
+    </criterion>
+    <criterion n="12" test="offline, StubPool mode block with patched small ALERT/DB constants, using the existing StubPool pattern">
+      Writers: an alert batch whose write times out (stub raising asyncio.TimeoutError) is counted as a failed write
+      (existing backoff applies), the writer task stays alive and later alerts are still written once the stub
+      recovers; Services.on_tick returns promptly (does not await the write) while the writer is stuck.
+    </criterion>
+    <criterion n="13" test="real Postgres via TEST_DATABASE_URL, new test in tests/test_rules_postgres.py using its existing fixtures and table cleanup; patch app.db.DB_COMMAND_TIMEOUT_SECONDS to ~0.5 BEFORE Database.connect() so the pool picks it up">
+      Lock test: with a second asyncpg connection holding `LOCK TABLE alert_rules IN ACCESS EXCLUSIVE MODE` in an open
+      transaction, GET /api/rules, POST /api/rules, and DELETE /api/rules/{id} (and GET /api/alerts with the lock on
+      `alerts`) each return 503 within a small multiple of the patched limit (assert elapsed under ~3 s) instead of
+      hanging. After the lock transaction is rolled back, the same requests succeed (pool still healthy, no leaked
+      connections: a subsequent request works). The test must roll back and close the holder connection in a finally
+      block so the cleanup that drops tables does not deadlock.
+    </criterion>
+    <criterion n="14" test="real Postgres, same file">
+      /health against a real, healthy Postgres returns database "ok"; with the pool closed or the database stopped it
+      reports "down" with 503 (stopping is not required; closing the pool via db._close_pool() suffices).
+    </criterion>
+    <criterion n="15" test="full offline suite">
+      All existing tests still pass after the listed edits; test_api_auth_coverage.py passes unchanged; the real
+      Postgres run on the throwaway PG17 cluster has 0 skipped.
+    </criterion>
+    <criterion n="16" test="process step, record in the report">
+      The new tests were run against the pre-change code first and failed (health tests: old body; timeout tests:
+      no kwarg / no 503 / hang is avoided via a test-level wait_for); this is recorded before the implementation.
+    </criterion>
+  </acceptance_criteria>
+
+  <existing_tests_that_change>
+    - backend/tests/test_auth.py::test_health_open - asserted body == {"status": "ok"}. New body has three fields; the
+      fixture's FakeFinnhubClient is not connected (connected False), so expected is database "ok", upstream
+      "disconnected", status "degraded", HTTP 200. Keep the "no key needed" intent.
+    - backend/tests/test_api_rules.py::test_no_db_rules_503_health_200_and_ticks_still_evaluated and
+      backend/tests/test_watchlist_alerts.py::test_startup_opt_out_starts_empty_and_503 - assert only status 200;
+      still true (database "disabled"). Only extend with the body assertion, optional.
+    - backend/tests/test_watchlist_alerts.py StubPool.acquire (line ~476) and _StubPool.acquire (line ~759) take no
+      arguments; they must accept `timeout=None` (and ignore or record it) because every acquire now passes timeout=.
+      Any other test double that implements acquire() must be updated the same way.
+    - backend/tests/fakes/fake_db.py (add ping) and backend/tests/fakes/fake_finnhub.py (add connected).
+    - All other existing tests are expected unchanged. If a Database test constructs a stub pool for create_pool and
+      does not accept command_timeout=, it changes too (none found by search).
+  </existing_tests_that_change>
+
+  <ambiguities_resolved>
+    1. "disabled" vs "down": disabled only for the explicit opt-out flag; flag true with no pool or a failed probe is
+       "down".
+    2. Overall status when database is "down": "degraded" (with 503).
+    3. Fourth constant for the health probe (HEALTH_DB_TIMEOUT_SECONDS = 2.0) is added although the request lists three
+       numbers; no setting.
+    4. Probe lives in a new Database.ping() because health must not touch pool internals and FakeDatabase needs a
+       matching method.
+    5. Startup 30 s wraps the whole _load_state (including the persistence-disabled branch), is read at call time via
+       the db module so tests can patch it; timeouts are handled before the generic load-error handler to keep
+       exception text out of the log.
+    6. connect() swallows its own errors into last_error; a startup timeout cancels it mid-flight, so the existing
+       startup except-branch (db.close()) is what releases the pool.
+    7. Routers need no code change: asyncio.TimeoutError is an Exception and already maps to 503; tests prove it.
+    8. FakeFinnhubClient gets connected=False by default, so default fake-upstream health is "degraded".
+    9. The alert writer's row-by-row retry after a batch timeout is left as is (each row can wait up to 5 s acquire +
+       5 s query); changing retry policy is out of scope.
+  </ambiguities_resolved>
+
+  <assumptions>
+    - Python 3.11+ semantics apply, or asyncio.TimeoutError is caught explicitly so it works on older versions too.
+    - asyncpg's command_timeout applies to executemany and transactional statements, including pg_advisory_xact_lock.
+    - A statement timeout mid-transaction leaves the pooled connection reset by asyncpg on release (no manual cleanup).
+    - /health does not require the lifespan to have run beyond what TestClient-as-context-manager provides.
+  </assumptions>
+
+  <edge_cases>
+    - Probe hangs: /health still answers within about HEALTH_DB_TIMEOUT_SECONDS.
+    - Concurrent /health calls while the pool is saturated: acquire times out, reports "down" (503), not a hang.
+    - upstream object without a `connected` attribute: treated as not connected, never an AttributeError/500.
+    - Startup timeout after the pool was created: pool closed, workers cancelled, upstream never started.
+    - create_rule_with_watchlist times out while holding the advisory lock inside a transaction: 503, the rule is not
+      in rule_store, the watchlist is not changed in memory.
+    - Timeout during delete: 503, rule remains in rule_store.
+    - /health response must never include exception text, connection URL, or key.
+  </edge_cases>
+
+  <out_of_scope>
+    Other medium audit items; docker-compose healthcheck wiring; frontend changes; new settings or .env.example
+    entries; changing alert/tick writer retry or queue policy; retry of failed requests; metrics; rate limiting;
+    editing CLAUDE.md (orchestrator does it); any git state change.
+  </out_of_scope>
+
+  <risks>
+    <risk severity="medium">The hanging-request tests can hang the suite if a timeout is not applied; every such test must
+      wrap the request in an outer bound (e.g. a thread/anyio timeout) so a regression fails instead of freezing.</risk>
+    <risk severity="medium">Real-Postgres lock test: the holder connection must be released or the per-test table DROP in the
+      fixture will block on the ACCESS EXCLUSIVE lock.</risk>
+    <risk severity="low">A 5 s command_timeout also bounds the startup DDL/backfill on a large table; the 30 s overall limit
+      is the backstop. Acceptable per the user decision.</risk>
+    <risk severity="low">An orchestrator probe such as docker healthcheck hitting /health will now see 503 when the DB is down;
+      that is the intent.</risk>
+    <risk severity="low">Row-by-row alert retry after a timeout can keep the writer busy for a long time (see ambiguity 9);
+      ingestion is unaffected because enqueue is non-blocking.</risk>
+  </risks>
+
+  <dependencies>
+    asyncpg (already pinned), asyncio, FastAPI Request access to app.state.services. Files: backend/app/db.py,
+    backend/app/main.py, backend/app/routers/health.py, backend/tests/fakes/fake_db.py,
+    backend/tests/fakes/fake_finnhub.py, backend/tests/test_auth.py, backend/tests/test_watchlist_alerts.py,
+    backend/tests/test_rules_postgres.py, plus new test file(s) for health and timeouts. PG17 binaries at
+    "C:/Program Files/PostgreSQL/17/bin" for the verification run only.
+  </dependencies>
+
+  <claude_md_update>
+    Suggest the orchestrator add: (1) API: "GET /health is open (no key) and returns {status, database, upstream};
+    database ok|down|disabled (disabled = RULES_PERSISTENCE_ENABLED=false), upstream connected|disconnected|disabled
+    (disabled = no Finnhub key); HTTP 503 only when database is down." (2) Invariant 5 addition: "Every database
+    operation is time-bounded by constants in db.py: DB_COMMAND_TIMEOUT_SECONDS (5), DB_ACQUIRE_TIMEOUT_SECONDS (5),
+    DB_STARTUP_TIMEOUT_SECONDS (30, startup fails loudly with 'startup failed: ... timed out'),
+    HEALTH_DB_TIMEOUT_SECONDS (2); a timeout in a request path is a 503, in a writer a failed write." (3) Remove any
+    statement that /health is a plain liveness check, and note tests' acquire() doubles must accept timeout=.
+  </claude_md_update>
+
+  <self_critique>
+    Every story maps to a criterion (health 1-7, request timeouts 8-10 and 13, startup 11, ingestion 12). Each criterion
+    names its test. Biggest remaining uncertainty: whether asyncpg actually surfaces command_timeout as a plain
+    asyncio.TimeoutError for pg_advisory_xact_lock inside a transaction on the pinned version, and the cancelled
+    connect() leaving a half-built pool; criterion 13 and 11 are the real-world checks that settle both.
+  </self_critique>
+</spec>

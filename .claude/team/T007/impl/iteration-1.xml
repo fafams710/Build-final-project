@@ -1,0 +1,21 @@
+<implementation>
+  <iteration>1</iteration>
+  <files>
+    <file path="backend/requirements.txt">runtime only, 6 packages pinned == to .venv versions</file>
+    <file path="backend/requirements-dev.txt">new: -r requirements.txt, pytest, pytest-asyncio, httpx pinned</file>
+    <file path=".github/workflows/ci.yml">postgres:16.10, requirements-dev.txt install and cache paths, npm ci</file>
+    <file path="docker-compose.yml">postgres:16.10</file>
+    <file path="frontend/Dockerfile">copy package-lock.json, npm ci</file>
+    <file path="README.md">line 36 uses requirements-dev.txt</file>
+  </files>
+  <tests>
+    <test>Fresh venv outside repo, pip install -r requirements-dev.txt, pytest: 33 passed, 6 skipped. npm ci, build, test pass. ci.yml parses.</test>
+  </tests>
+  <commands_run><command>pip freeze (.venv); fresh venv pytest; npm ci/build/test; yaml.safe_load</command></commands_run>
+  <design_decisions>
+    <decision>postgres:16.10 chosen as a certainly published 16 minor; rejected guessing a newer minor.</decision>
+    <decision>README npm install left unchanged per spec.</decision>
+  </design_decisions>
+  <blocked_reason>none</blocked_reason>
+  <self_critique>.venv is Python 3.13 while CI/Docker use 3.12; fresh-venv check ran on local Python, not 3.12 on Linux.</self_critique>
+</implementation>

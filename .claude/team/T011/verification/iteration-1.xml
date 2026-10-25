@@ -1,0 +1,17 @@
+<verification>
+  <iteration>1</iteration>
+  <verdict>pass</verdict>
+  <items>
+    <item id="1" result="PASS">Offline: 130 passed, 19 skipped (skips = real-PG tests). Real PG17 throwaway cluster (port 55525, trust, temp dir outside repo): 149 passed, 0 skipped. Cluster stopped and deleted.</item>
+    <item id="2" result="PASS">Temp venv outside repo, pip install -r requirements-dev.txt succeeded (network OK); fastapi 0.159.1, starlette 1.10.0. Full offline pytest on it: 130 passed, 19 skipped. Note: 0.159.1 ALSO produces lazy _IncludedRouter nodes in app.routes (verified directly), so the effective_candidates() branch ran on the pin; the plain-routes fallback branch ran on neither version (untested). Coverage tests (8) pass and self-check (unprotected dummy /api/x flagged, non-key dependency flagged) works on 0.159.1. Venv deleted.</item>
+    <item id="3" result="PASS">Scratch copies of backend outside repo: (a) alerts router included directly on app -> coverage tests fail with offenders ['/api/alerts']; (b) parent changed to APIRouter() with no dependency -> fail with offenders symbols/rules/alerts. Repo files untouched.</item>
+    <item id="4" result="PASS">before.* vs after.* openapi (cmp) and routes (cmp) identical. Regenerated from current code on 3.13/0.162.0 and on 0.159.1: identical to before. Also regenerated baseline from git show HEAD:backend/app/main.py in a scratch copy: identical to the scratchpad before.* (so the baseline is genuine).</item>
+    <item id="5" result="PASS">Real uvicorn (random APP_API_KEY, throwaway PG, local fake Finnhub ws), all 36 checks passed: GET/POST/DELETE /api/rules, GET /api/alerts, GET /api/symbols return 401 {"detail":"invalid or missing API key"} with no/wrong key and 200/201/404 (delete of unknown id) with key; invalid body without key 401, with key 422; real rule delete 401 then 204; /health, /docs, /redoc, /openapi.json 200 without key; OPTIONS preflight 200 with allow-origin and x-api-key allow-header; /ws good key (with and without Origin) subscribed, wrong/missing key, bad origin, non-ASCII key all 403 and none forwarded upstream; key absent from uvicorn log in all encodings.</item>
+    <item id="6" result="PASS">git status --short (read-only): ' M backend/app/main.py' and '?? backend/tests/test_api_auth_coverage.py' only. git diff of main.py: APIRouter import, parent router with require_api_key built inside create_app, three routers included into it, app includes parent; nothing else.</item>
+  </items>
+  <overall>PASS</overall>
+  <runtime_check result="yes">uvicorn started as subprocess with fake Finnhub ws; driver script in scratchpad drive11.py, output out11.txt.</runtime_check>
+  <bugs/>
+  <processes>Started and removed: fake finnhub PID 35112, uvicorn PID 12828 (terminated), throwaway postgres (postmaster 7056, stopped via pg_ctl), pg_ctl hung once on a piped start (Windows service session, could not be killed, not mine to manage). Pre-existing, not mine: python uvicorn on port 8766 (PID 48660), the 5432 service.</processes>
+  <self_critique>Plain-routes fallback branch of the walker never executed on any installed version. Windows-only environment; CORS/ws checked with a custom driver, not a browser. Frontend not exercised.</self_critique>
+</verification>

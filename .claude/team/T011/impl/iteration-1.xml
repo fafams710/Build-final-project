@@ -1,0 +1,33 @@
+<implementation>
+  <iteration>1</iteration>
+  <files>
+    <file path="backend/app/main.py">create_app: one APIRouter(dependencies=[Depends(require_api_key)]) built per call; symbols/rules/alerts routers included into it; app includes only the parent (plus health, ws); commented as the single place for future /api routers; import APIRouter.</file>
+    <file path="backend/tests/test_api_auth_coverage.py">new: route walker (dependant tree, identity check on require_api_key) plus 8 tests: real app protected and non-vacuous, self-check unprotected dummy flagged, non-key dependency flagged, positive control, nested dependency accepted, open routes not walked, no route duplication over 3 create_app calls, /docs /redoc /openapi.json 200 without key.</file>
+  </files>
+  <tests>
+    <test>New file written first: 8 passed BEFORE the production change. Walker already reported all /api routes protected (it is a guard, so passing pre-change is expected); self-check tests proved it detects an unprotected dummy.</test>
+    <test>Offline pytest after change: 130 passed, 19 skipped (skips are real-Postgres tests).</test>
+    <test>Real-Postgres pytest (throwaway PG17, port 55521, trust auth, temp dir outside repo): 149 passed, 0 skipped. Cluster stopped and deleted; port 55521 not listening. Remaining postgres processes belong to the pre-existing service on 5432, not started by me.</test>
+  </tests>
+  <commands_run>
+    <command>snap.py (scratchpad T011) dumping openapi JSON (sort_keys) and sorted (path, methods) flat route list, before and after; cmp</command>
+    <command>python -X faulthandler -m pytest -o faulthandler_timeout=120 (new file; full offline; full with TEST_DATABASE_URL)</command>
+    <command>initdb / pg_ctl start / createdb / pg_ctl stop / rm -rf on temp cluster. No git or gh commands.</command>
+  </commands_run>
+  <before_after>
+    openapi.json: byte-identical (cmp, 5297 bytes). Route list identical (11 entries: /api/alerts GET, /api/rules GET+POST, /api/rules/{rule_id} DELETE, /api/symbols GET, /docs, /docs/oauth2-redirect, /health, /openapi.json, /redoc, /ws). Files in scratchpad T011: before.* and after.*.
+  </before_after>
+  <design_decisions>
+    <decision>Parent unprefixed, child routers untouched (they carry full /api prefixes), as the spec said; rejected prefix="/api" plus shortening children.</decision>
+    <decision>Parent built inside create_app, not module-level, to avoid route accumulation; rejected a module-level router.</decision>
+    <decision>Walker flattens app.routes via duck typing on effective_candidates(): installed FastAPI 0.162.0 stores include_router as lazy _IncludedRouter nodes (no .path, no copied routes), so iterating app.routes directly would see zero /api routes. Falls back to plain routes for older FastAPI (requirements.txt pins 0.159.1). Rejected relying on route.path of app.routes. It uses a private-ish FastAPI API; the non-vacuous count and self-check tests guard it.</decision>
+    <decision>For non-APIRoute contexts the path and dependant come from starlette_route (e.g. /ws), else the context.</decision>
+  </design_decisions>
+  <deviations>
+    Installed FastAPI (0.162.0) differs from the pinned 0.159.1; walker written to handle both shapes. I could not run against 0.159.1 to confirm the older shape (the fallback branch is untested). No other deviations. CLAUDE.md not edited.
+  </deviations>
+  <blocked_reason>none</blocked_reason>
+  <self_critique>
+    Least covered: the walker under the pinned 0.159.1 (only 0.162.0 installed locally); CI installs the pin, so the fallback branch matters there. Walker relies on FastAPI internals (effective_candidates, dependant), guarded by the positive-count and self-check tests.
+  </self_critique>
+</implementation>

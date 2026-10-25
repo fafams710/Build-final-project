@@ -1,0 +1,38 @@
+<verification>
+  <iteration>1</iteration>
+  <verdict>pass</verdict>
+  <criteria>
+    <criterion id="1">PASS - offline pytest: 122 passed, 19 skipped (skips = real-Postgres file). Real-Postgres (throwaway PG17, trust auth, port 55515, temp dir outside repo, -rs): 141 passed, 0 skipped; cluster stopped and deleted. Frontend npm test: 3 files / 12 tests passed; npm run build OK.</criterion>
+    <criterion id="2">PASS - on a baseline copy (git archive HEAD, plus new conftest.py and test_auth.py): 24 failed, 5 passed (no app.security, REST returns 200 not 401, ws not rejected, startup does not fail). Baseline + ApiKey.test.tsx (node_modules junctioned): 6 of 7 fail (the 500-keeps-key test passes trivially on baseline). All pass on the current tree.</criterion>
+    <criterion id="3a">PASS - real uvicorn (python -m uvicorn app.main:app, random key containing + / =, throwaway PG, local fake Finnhub ws). GET/POST/DELETE /api/rules, GET /api/alerts, GET /api/symbols: no header 401, wrong header 401, right header 200/201/404/200/200. 401 body is exactly {"detail":"invalid or missing API key"} for missing and wrong. POST with invalid body and no key gives 401; with key gives 422. Deleting a real rule: 401 without key, 204 with. /health returns 200 with no key. Preflight OPTIONS from http://localhost:5173 with Access-Control-Request-Headers: x-api-key returns 200, Allow-Origin equals the origin, x-api-key in Allow-Headers.</criterion>
+    <criterion id="3b">PASS - /ws: good key + Origin http://localhost:5173 accepted, subscribe returned "subscribed" (MSFT) and upstream saw the subscribe. Good key with no Origin accepted (TSLA). Wrong key, missing key, Origin http://evil.example with good key, no Origin + no key, non-ASCII key: all rejected with HTTP 403 handshake. The fake Finnhub log contains no REJ* symbols (nothing subscribed upstream from rejected connections).</criterion>
+    <criterion id="3c">PASS - captured stdout+stderr in full: raw key 0 hits, quote(safe='') 0, default quote 0, %2B-only variant 0, key without trailing '=' 0, "+/=" 0. Lines show masking: 'GET /api/rules?key=*** HTTP/1.1', 'GET /api/alerts?a=1&amp;key=***', 'WebSocket /ws?key=***" [accepted]' and '... 403'. App lines also contain no key.</criterion>
+    <criterion id="3d">PASS - APP_API_KEY="" (and "   ") with RULES_PERSISTENCE_ENABLED=true and false: uvicorn exit code 3, log line "startup failed: APP_API_KEY is not set; generate one with ...", RuntimeError, "Application startup failed. Exiting.". DATABASE_URL pointed at an unreachable port 1 produced no DB error (so Postgres was not attempted), and the fake Finnhub saw no CONNECT.</criterion>
+    <criterion id="4">PASS - Vite dev server (node vite.js from frontend/, VITE_BACKEND_URL unset, backend on 127.0.0.1:8000): GET http://localhost:5173/api/rules without key 401, wrong key 401, right key 200. ws://localhost:5173/ws?key=... with Origin http://localhost:5173 accepted via proxy and subscribe worked; Origin http://evil.example and wrong key rejected (403). Listener check (Get-NetTCPConnection): vite node PID bound to ::1:5173 only, not 0.0.0.0 or ::.</criterion>
+    <criterion id="5">PASS - git diff docker-compose.yml: only 127.0.0.1:5433:5432, 127.0.0.1:8000:8000, 127.0.0.1:5173:5173 and APP_API_KEY: ${APP_API_KEY:?set APP_API_KEY in .env}. YAML parses (PyYAML). Docker is not installed, so compose config/up was not run.</criterion>
+    <criterion id="6">PASS - by reading frontend/src/api/client.ts and Dashboard.tsx: key stored in sessionStorage only (grep finds no localStorage in src); X-API-Key sent on listRules, createRule (merged with Content-Type), deleteRule, listAlerts; wsUrl appends key via encodeURIComponent with ? or &amp;; check() on 401 clears key and notifies listeners; Dashboard gate renders KeyPrompt without a key, so useWebSocket (inside DashboardContent) is not mounted and no ws opens before a key exists.</criterion>
+    <criterion id="7">PASS - README and .env.example match behaviour (APP_API_KEY generation, dashboard prompt, 127.0.0.1 bindings, 5433 vs 5432, CORS origin note, curl/Invoke-RestMethod headers, /ws?key=, 401 body, 1008 on ws rejection). Minor wording nuance: README says the ws "closes with code 1008"; the observed handshake response is HTTP 403 (Starlette's pre-accept close).</criterion>
+    <criterion id="8">PASS - git log -1 is dde2e39; git status shows 14 modified + 3 untracked (security.py, test_auth.py, ApiKey.test.tsx), nothing else; CLAUDE.md untouched. Throwaway PG stopped and its dir deleted, baseline copy deleted; no python/node/uvicorn/vite/fake-Finnhub processes of mine left; nothing listening on 55515/55601/55602/55603/8000/5173. Seven postgres.exe in Session 0 are pre-existing system services, not mine.</criterion>
+  </criteria>
+  <test_results>
+    <result>cd backend; python -X faulthandler -m pytest -o faulthandler_timeout=120 -> 122 passed, 19 skipped</result>
+    <result>TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55515/t010test pytest -rs -> 141 passed, 0 skipped</result>
+    <result>baseline copy + new test_auth.py + new conftest.py -> 24 failed, 5 passed</result>
+    <result>baseline copy + ApiKey.test.tsx (vitest) -> 6 failed, 6 passed (existing)</result>
+    <result>frontend npm test -> 12 passed (3 files); npm run build -> OK</result>
+  </test_results>
+  <runtime_check result="yes">
+    Ran real uvicorn against a throwaway PG17 and a self-written fake Finnhub ws; drove every REST route, ws accept/reject cases, preflight, log leakage grep, no-key startup (persistence on/off, whitespace key), and the Vite dev server proxy for REST and ws including Origin forwarding. Scripts are in the scratchpad (drive.py, vitetest.py, fakefh.py).
+  </runtime_check>
+  <bugs>
+    <bug>
+      <description>Low, observation only, not a defect proven: in the first Vite proxy run, the first proxied GET /api/rules with a valid key timed out after 5 s on the client side even though uvicorn logged 200. Two later full reruns (15 s timeout) succeeded with no repeat. Likely a cold-start artifact of the Vite dev proxy, not reproducible.</description>
+      <reproduction>Start backend on 127.0.0.1:8000 and vite from frontend/ together, then immediately send GET http://localhost:5173/api/rules with X-API-Key; seen once in 3 runs.</reproduction>
+      <severity>low</severity>
+      <owner>implementer</owner>
+    </bug>
+  </bugs>
+  <self_critique>
+    Not tested: uvicorn --reload (log mask install), Docker/compose runtime, a real browser (Dashboard behaviour verified only via vitest and code reading), real Finnhub, Windows-only environment (Linux uvicorn log setup may differ, though the same dictConfig mechanism applies). Vite listens on ::1 because localhost resolved to IPv6 here; on other hosts it may bind 127.0.0.1 instead. .env.example still has VITE_BACKEND_URL=http://localhost:8000 (the IPv6 concern the orchestrator fixed only in the vite.config default); not a failure since the override is documented as unchanged. /docs and /openapi.json remain open by decision. The real .env has an APP_API_KEY= line (counted only, value not read); backend runs used explicit env overrides.
+  </self_critique>
+</verification>

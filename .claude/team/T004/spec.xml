@@ -1,0 +1,85 @@
+<spec>
+  <user_stories>
+    - As a maintainer, I want Redis, TimescaleDB and webhooks removed so the stack is only FastAPI + Finnhub + (optional) plain Postgres.
+    - As a developer, I want the app to start and tests to pass with no Redis/Postgres configured.
+    - As a user creating a rule, I only supply symbol, type, threshold and (for percent_change) window; there is no webhook field.
+    - As an operator, I want a fired rule to remain observable (INFO log line).
+    - As a deployer, I want docker-compose and CI to use a plain Postgres 16 image and no Redis service.
+  </user_stories>
+
+  <acceptance_criteria>
+    1. From backend/, `pytest` passes offline.
+    2. From frontend/, `npm run build` and `npm test` pass.
+    3. `grep -rniE "redis|webhook|timescale|hypertable"` over backend/ (including tests/), frontend/src, frontend/tests, docker-compose.yml, .github/, .env.example, and requirements files returns nothing. (frontend/tests included so the Dashboard test is cleaned too.)
+    4. `backend/app/redis_cache.py`, `backend/app/webhooks.py`, `backend/tests/test_webhooks.py` do not exist.
+    5. `uvicorn app.main:app` starts with DATABASE_URL empty and no Redis; GET /health returns {"status":"ok"}.
+    6. POST /api/rules with {symbol,type,threshold[,window_seconds]} and no webhook_url returns 201; response and GET /api/rules contain no webhook_url key. A body that still includes webhook_url is ignored, not an error (default pydantic behavior) - or, if the implementer prefers, rejected with 422; either is acceptable but must be tested/consistent. Existing 422 validation (negative threshold, bad type, bad symbol, percent_change without window) still holds.
+    7. When a rule fires on a tick, exactly one INFO-level log record is emitted per firing (edge-triggered, so a second tick above threshold logs nothing) containing at least rule_id, symbol, rule type, threshold and price. A backend test asserts this with caplog. The tick broadcast to subscribed browsers still occurs, and a failure while logging/evaluating must not stop the broadcast (invariant 3).
+    8. Settings: config.py no longer has webhook_signing_secret, redis_url, webhook_max_attempts, webhook_timeout_seconds, webhook_retry_backoff_seconds; .env.example no longer has WEBHOOK_SIGNING_SECRET, REDIS_URL, WEBHOOK_MAX_ATTEMPTS, WEBHOOK_TIMEOUT_SECONDS; the "timescaledb service" comment is reworded (e.g. "postgres service"). Remaining settings are unchanged.
+    9. db.py: HYPERTABLE constant and its execute/try-except are gone; docstring says plain Postgres; `webhook_url` removed from the alert_rules CREATE TABLE, from the save_rule INSERT/ON CONFLICT column list, placeholders and args (renumber $n placeholders correctly). ticks table, tick worker, load/delete logic otherwise unchanged. load_rules still builds Rule from rows.
+    10. requirements.txt has no `redis` or `hiredis` entry; other entries untouched.
+    11. docker-compose.yml: no redis service; the `timescaledb` service becomes `postgres` using image `postgres:16` (or `postgres:16-alpine`), same env/ports; volume renamed (e.g. pgdata) consistently; backend DATABASE_URL host points to `postgres`; backend env drops WEBHOOK_SIGNING_SECRET and REDIS_URL; backend depends_on only `postgres`.
+    12. .github/workflows/ci.yml: redis service and REDIS_URL env removed; DB service is `postgres:16` (service key renamed from timescaledb); DATABASE_URL env kept pointing at localhost:5432.
+    13. Frontend: `webhook_url` removed from the rule type in api/client.ts, from the createRule payload, and the URL input/state removed from RuleForm.tsx; Dashboard.test.tsx no longer fills "webhook url" and still asserts the POST body matches symbol/type/threshold and has no webhook_url.
+    14. README.md and ROADMAP.md: references to Redis, TimescaleDB, webhooks (architecture diagram, rules description, setup comment about WEBHOOK_SIGNING_SECRET, example POST body, CI description, API table row for price, roadmap items on webhooks/SSRF/hypertable/webhook latency/delivery log/Redis cache) are removed or reworded to match; no such terms remain. CLAUDE.md and revised-planning.md are NOT edited.
+    15. Out-of-scope files unchanged except the minimal cache-removal edits listed under file changes: connection_manager.py, subscription_manager.py, useWebSocket.ts, no new tables, no auth, no pinning.
+  </acceptance_criteria>
+
+  <file_changes>
+    Backend app:
+    - DELETE backend/app/redis_cache.py, backend/app/webhooks.py.
+    - backend/app/main.py: drop PriceCache and WebhookDispatcher imports; Services.__init__ loses cache and webhooks params/attributes; create_app loses `cache` and `webhooks` params; on_tick: keep db.enqueue_tick, remove cache spawn, replace webhook dispatch with a log.info per fired (rule, event) (kept inside the existing guarded try so broadcast still runs); shutdown drops webhooks.close() and cache.close(). _spawn/_tasks may remain if still used, else remove only if now dead (implementer's call; keep minimal).
+    - backend/app/models.py: remove webhook_url field from RuleCreate and its validator; remove now-unused urlparse and field_validator imports only if unused (symbol validator still uses field_validator).
+    - backend/app/config.py and .env.example: remove settings listed in AC 8 together.
+    - backend/app/db.py: per AC 9.
+    - backend/app/routers/ws.py: remove the snapshot-from-cache block on subscribe (it calls svc.cache.get_price). This is the minimum edit needed because the cache no longer exists; no other ws.py behavior changes.
+    - backend/app/routers/symbols.py: remove the GET /api/symbols/{symbol}/price endpoint (it reads svc.cache). Other symbol endpoints unchanged. rules router needs no change unless it references webhook_url (grep found none; it uses the model).
+    - backend/app/rules.py: no change required (event dict has no webhook_url).
+    - backend/requirements.txt: per AC 10.
+    Backend tests:
+    - DELETE backend/tests/test_webhooks.py.
+    - conftest.py: remove FakeCache, RecordingWebhooks, fake_cache and webhooks fixtures, webhook_signing_secret/redis_url from settings fixture, cache/webhooks args to create_app.
+    - test_api_rules.py: drop webhook_url from BASE and the "ftp://x" assertion.
+    - test_rules_engine.py: drop webhook_url=URL / URL constant.
+    - test_api_symbols.py: remove fake_cache/webhooks params; delete test_snapshot_from_cache_on_subscribe (keep its bogus-action/not-json error assertions by moving them into a small test without cache); replace test_tick_updates_cache_and_rule_fires_webhook with a test that posts a rule, drives two ticks, and asserts one INFO log via caplog (AC 7); add/keep a test that a price_above tick still reaches a subscribed websocket.
+    - Add or adjust a test that GET /api/symbols/{sym}/price is gone only if desired; not required.
+    Frontend: src/api/client.ts, src/components/RuleForm.tsx, tests/Dashboard.test.tsx per AC 13. Dashboard.tsx keeps handling "snapshot" messages (harmless, it is in useWebSocket-adjacent UI and out of scope).
+    Infra/docs: docker-compose.yml, .github/workflows/ci.yml, README.md, ROADMAP.md per AC 11, 12, 14.
+  </file_changes>
+
+  <assumptions>
+    - The Redis cache was also feeding two features: the "snapshot" message on websocket subscribe (routers/ws.py) and GET /api/symbols/{symbol}/price (routers/symbols.py). Request says remove every usage of redis_cache, so both are removed rather than replaced with an in-memory last-price store (that would be new design). This touches ws.py minimally despite ws.py being listed as "stays"; the websocket protocol otherwise is unchanged.
+    - Current code has no browser broadcast of rule triggers (only plain ticks), so the webhook was the only trigger effect; per the request, log at INFO instead. No new websocket message type is added.
+    - Log format is free-form as long as it carries the fields in AC 7.
+    - ticks persistence (plain table, no hypertable) is kept; "keep everything else in db.py".
+    - Unknown extra field webhook_url in POST body is tolerated (pydantic default) unless implementer chooses to reject; I treat either as acceptable.
+    - Postgres image tag: `postgres:16`.
+    - package-lock.json and frontend dependencies are unaffected.
+  </assumptions>
+
+  <edge_cases>
+    - Edge-triggered semantics must be preserved: one log per false-to-true flip, re-arm when false again.
+    - App must start with empty DATABASE_URL (Database.connect returns early) and with Postgres unreachable (existing error path).
+    - Rules loaded from an existing database whose alert_rules rows still have a webhook_url column must not crash load_rules (Rule ignores extra keys; verify Rule model does not forbid extras).
+    - Rule/event logging must not log secrets (none exist now) and must not raise on percent_change rules where window_seconds is set.
+    - Websocket subscribe still replies "subscribed" and no longer sends "snapshot"; bogus action and non-JSON still return "error".
+    - Shutdown with no upstream (no API key) still completes cleanly.
+  </edge_cases>
+
+  <risks>
+    <risk severity="medium">Existing deployed Postgres volumes: a pre-existing alert_rules table has webhook_url TEXT NOT NULL; CREATE TABLE IF NOT EXISTS will not drop it, so save_rule INSERTs without that column will fail (swallowed and logged as best-effort, rules still work in memory but are not persisted). Out of scope to migrate; fresh volumes and CI are fine. Document in notes; users may need to drop the table/volume.</risk>
+    <risk severity="medium">Removing the snapshot and /price endpoint is a user-visible feature loss and edits ws.py/symbols.py that the request lists as staying; the orchestrator/user should confirm that is acceptable (alternative: in-memory last-price dict, which is new design).</risk>
+    <risk severity="low">Grep AC could trip on incidental words (e.g. docs, comments, test names containing "webhook"); implementer must run the grep including backend/tests and frontend/tests.</risk>
+    <risk severity="low">Renumbering SQL placeholders in save_rule is easy to get wrong; there is no real-DB test (out of scope), so review by reading.</risk>
+  </risks>
+
+  <dependencies>
+    - Removes the `redis` python package; asyncpg remains (plain Postgres).
+    - Docker image postgres:16 (compose and CI).
+    - No new packages.
+  </dependencies>
+
+  <self_critique>
+    Every story maps to a criterion: stack removal (3,4,10-12), startup/offline (1,2,5), rule form (6,13), observability (7), infra (11,12). All criteria are checkable by pytest, npm, or grep. Biggest uncertainty: the snapshot/price-endpoint removal decision (assumed, flagged) and whether the reviewer wants a websocket trigger broadcast, which the request only requires if one already existed (it did not). Also the stale NOT NULL column on existing databases is knowingly left unhandled.
+  </self_critique>
+</spec>

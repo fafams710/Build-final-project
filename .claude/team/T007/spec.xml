@@ -1,0 +1,55 @@
+<spec>
+  <user_stories>
+    <story>As a reviewer, I want every backend dependency pinned to an exact version so builds are reproducible.</story>
+    <story>As a deployer, I want the production backend image to install only runtime packages, with no test tools.</story>
+    <story>As a developer/CI, I want one requirements-dev.txt that gives me runtime plus test tooling.</story>
+    <story>As a maintainer, I want the Postgres image pinned to the same exact 16.x tag in docker-compose and CI.</story>
+    <story>As a maintainer, I want frontend installs (CI and Docker) to use the lockfile via npm ci.</story>
+  </user_stories>
+  <acceptance_criteria>
+    <c n="1">backend/requirements.txt contains only runtime packages: fastapi, uvicorn[standard], websockets, asyncpg, pydantic, pydantic-settings. Every non-blank line matches name==x.y.z (extras such as [standard] allowed). No >=, ~=, ^, or unpinned names. Pass: regex check over the file.</c>
+    <c n="2">backend/requirements.txt does not contain pytest, pytest-asyncio, or httpx. Pass: grep finds none.</c>
+    <c n="3">backend/requirements-dev.txt is new. It has `-r requirements.txt`, then pytest==x, pytest-asyncio==x, httpx==x. Every other line is name==x.y.z. Pass: regex check.</c>
+    <c n="4">Every pinned version equals the version installed in the repo-root .venv. The implementer reads them with `pip freeze` / `pip show` from that venv for the 7 directly listed packages plus pytest and pytest-asyncio. No version is guessed or upgraded. Transitive dependencies are not pinned (see assumptions).</c>
+    <c n="5">A fresh venv outside the repo, with `pip install -r backend/requirements-dev.txt`, runs `pytest` from backend/ green: 33 passed, 6 skipped when TEST_DATABASE_URL is unset.</c>
+    <c n="6">.github/workflows/ci.yml: the backend job runs `pip install -r requirements-dev.txt`. cache-dependency-path covers requirements-dev.txt and requirements.txt. The frontend job runs `npm ci` instead of `npm install`. The file parses as valid YAML.</c>
+    <c n="7">The postgres image in ci.yml and in docker-compose.yml is the same exact tag, `postgres:16.<minor>` (a current 16 minor chosen by the implementer; no bare `postgres:16`, no `latest`). Pass: the two image strings are identical.</c>
+    <c n="8">backend/Dockerfile still installs only requirements.txt. This is verified and left unchanged unless a change is needed.</c>
+    <c n="9">frontend/Dockerfile uses `npm ci`. It copies package-lock.json alongside package.json before the install, so npm ci can run.</c>
+    <c n="10">README.md: the backend development/test install instruction (currently `pip install -r requirements.txt` at line ~36) uses requirements-dev.txt. Any README text that says requirements.txt includes test tools is corrected. `npm install` at line ~44 is left as is unless the implementer judges it a CI-style install, since the request limits README edits to the pip command. CLAUDE.md is NOT edited.</c>
+    <c n="11">`npm ci && npm run build && npm test` pass in frontend/. frontend/package.json and package-lock.json are unchanged.</c>
+    <c n="12">No other files change. App code, tests, and versions are unchanged.</c>
+  </acceptance_criteria>
+  <assumptions>
+    <a>httpx placement: grep of backend/ shows httpx appears only in requirements.txt. It is imported nowhere in backend/app and nowhere in backend/tests. Tests use TestClient or AsyncClient (conftest.py, test_rules_postgres.py, test_api_symbols.py). Starlette's TestClient requires httpx, so httpx is test-only and goes in requirements-dev.txt. Note: the request's runtime list says "httpx if used at runtime", and it is not.</a>
+    <a>If the venv has httpx installed (the tests need it), its installed version is pinned. If the venv lacks httpx, the implementer must stop and report instead of choosing a version.</a>
+    <a>Only direct dependencies are pinned, matching the existing file style. A full transitive lock (pip-compile) is out of scope.</a>
+    <a>The repo-root .venv is assumed to be the Python 3.12 environment the suite passes in. CI and Docker use 3.12.</a>
+    <a>The implementer picks the postgres 16 minor tag. It must be a real, published tag, and the same string is used in both files.</a>
+    <a>The frontend Dockerfile change (copying package-lock.json) is required for "uses npm ci" and is not scope creep. Backend Dockerfile needs no change because it already references only requirements.txt.</a>
+    <a>The `[standard]` extra on uvicorn is kept. Its pin applies to uvicorn only.</a>
+  </assumptions>
+  <edge_cases>
+    <e>pip freeze shows uvicorn without the extra. The pin is still `uvicorn[standard]==x`.</e>
+    <e>pydantic-settings and pydantic version compatibility: pin the exact pair from the venv.</e>
+    <e>`-r requirements.txt` in the dev file resolves relative to the dev file, so it works from any cwd and in CI (working-directory backend).</e>
+    <e>CI pip cache keyed only on requirements.txt would miss dev changes. Include both files in cache-dependency-path.</e>
+    <e>Windows line endings and a trailing newline: keep the files plain, one requirement per line.</e>
+    <e>The pinned versions must still be installable on Linux Python 3.12 (CI). Nothing in the pins should be Windows-specific.</e>
+  </edge_cases>
+  <risks>
+    <risk severity="medium">The venv may contain versions that differ from what CI previously resolved. Pinning could expose a latent incompatibility on Linux. Mitigation: criterion 5 fresh-venv verification.</risk>
+    <risk severity="low">Docker build with npm ci fails if package-lock.json is out of sync with package.json. Criterion 11 checks this.</risk>
+    <risk severity="low">Pinned Postgres minor tag typo or nonexistent tag breaks compose and CI.</risk>
+    <risk severity="low">Moving httpx out of the runtime file would break anything that imports it at runtime. Grep shows nothing does.</risk>
+  </risks>
+  <dependencies>
+    <d>repo-root .venv (source of versions)</d>
+    <d>backend/requirements.txt, backend/requirements-dev.txt (new), backend/Dockerfile</d>
+    <d>frontend/Dockerfile, frontend/package-lock.json (existing, committed)</d>
+    <d>.github/workflows/ci.yml, docker-compose.yml, README.md</d>
+  </dependencies>
+  <self_critique>
+    Every story maps to criteria: pinning (1,3,4), runtime-only image (2,8), dev file (3,5,6), Postgres tag (7), npm ci (6,9,11). All criteria are mechanically checkable. The biggest uncertainty is whether the venv really has the 33-pass environment and whether httpx is installed there. The "pin exact versions" requirement cannot be verified without running pip freeze, which the planner could not do. Also unconfirmed: whether the README should have its `npm install` line changed. The request only mandates the pip line, so that is left optional.
+  </self_critique>
+</spec>

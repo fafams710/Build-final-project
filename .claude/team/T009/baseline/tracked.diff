@@ -1,0 +1,914 @@
+diff --git a/.env.example b/.env.example
+index 6e9fa0c..560d066 100644
+--- a/.env.example
++++ b/.env.example
+@@ -7,6 +7,8 @@ FINNHUB_WS_URL=wss://ws.finnhub.io
+ CORS_ORIGINS=http://localhost:5173
+ RULES_PERSISTENCE_ENABLED=true
+ TICKS_PERSISTENCE_ENABLED=true
++# Max distinct watched symbols (Finnhub free tier); a rule for a new symbol beyond it gets 409
++WATCHLIST_MAX_SYMBOLS=50
+ RECONNECT_INITIAL_SECONDS=1.0
+ RECONNECT_MAX_SECONDS=30.0
+ 
+diff --git a/backend/app/config.py b/backend/app/config.py
+index ce0ff6d..6de778b 100644
+--- a/backend/app/config.py
++++ b/backend/app/config.py
+@@ -15,6 +15,8 @@ class Settings(BaseSettings):
+     rules_persistence_enabled: bool = True
+     ticks_persistence_enabled: bool = True
+ 
++    watchlist_max_symbols: int = 50
++
+     reconnect_initial_seconds: float = 1.0
+     reconnect_max_seconds: float = 30.0
+ 
+diff --git a/backend/app/connection_manager.py b/backend/app/connection_manager.py
+index 03b4c74..388a420 100644
+--- a/backend/app/connection_manager.py
++++ b/backend/app/connection_manager.py
+@@ -35,10 +35,6 @@ class ConnectionManager:
+             except Exception:
+                 log.exception("on_disconnect callback failed")
+ 
+-    @property
+-    def connection_ids(self) -> list[str]:
+-        return list(self._conns)
+-
+     def __len__(self) -> int:
+         return len(self._conns)
+ 
+@@ -56,10 +52,3 @@ class ConnectionManager:
+         ids = list(conn_ids)
+         if ids:
+             await asyncio.gather(*(self._send_one(c, message) for c in ids))
+-
+-    async def broadcast(self, message: dict) -> None:
+-        await self.send_to(self.connection_ids, message)
+-
+-    async def broadcast_symbol(self, subscriptions: Any, symbol: str, message: dict) -> None:
+-        """Send to only the connections subscribed to `symbol` (assumption A1)."""
+-        await self.send_to(subscriptions.subscribers(symbol), message)
+diff --git a/backend/app/db.py b/backend/app/db.py
+index b0dcc97..ac40707 100644
+--- a/backend/app/db.py
++++ b/backend/app/db.py
+@@ -5,7 +5,7 @@ import logging
+ from datetime import datetime, timezone
+ from typing import Any, Optional
+ 
+-from .models import Rule, Tick
++from .models import Alert, Rule, Tick, normalize_symbol
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -27,13 +27,40 @@ SCHEMA = [
+     )""",
+     # Old volumes had a NOT NULL webhook_url column; drop it, keeping rows.
+     "ALTER TABLE alert_rules DROP COLUMN IF EXISTS webhook_url",
++    """CREATE TABLE IF NOT EXISTS watchlist (
++        symbol TEXT PRIMARY KEY,
++        created_at DOUBLE PRECISION NOT NULL
++    )""",
++    # No foreign key to alert_rules: alerts outlive their rule.
++    """CREATE TABLE IF NOT EXISTS alerts (
++        id TEXT PRIMARY KEY,
++        rule_id TEXT NOT NULL,
++        symbol TEXT NOT NULL,
++        rule_type TEXT NOT NULL,
++        threshold DOUBLE PRECISION NOT NULL,
++        price DOUBLE PRECISION NOT NULL,
++        triggered_at DOUBLE PRECISION NOT NULL
++    )""",
++    "CREATE INDEX IF NOT EXISTS alerts_triggered_at_idx ON alerts (triggered_at DESC)",
+ ]
+ 
++# Shutdown waits at most this long for queued alerts to be written.
++ALERT_DRAIN_TIMEOUT_SECONDS = 3.0
++# Pause after a failed alert batch so a down database is not hammered.
++ALERT_FAILURE_BACKOFF_SECONDS = 1.0
++
++# Serialises watchlist cap checks across concurrent rule creations.
++_WATCHLIST_LOCK_KEY = 8_008_001
++
+ 
+ class DatabaseUnavailable(RuntimeError):
+     """Raised when rule persistence is requested but there is no usable database."""
+ 
+ 
++class WatchlistFull(RuntimeError):
++    """Raised when a rule for a new symbol would exceed the watchlist cap."""
++
++
+ def _ts(seconds: float) -> datetime:
+     return datetime.fromtimestamp(seconds, tz=timezone.utc)
+ 
+@@ -45,6 +72,7 @@ class Database:
+         persist_rules: bool = True,
+         persist_ticks: bool = True,
+         queue_size: int = 10000,
++        alert_queue_size: int = 1000,
+     ) -> None:
+         self._url = url
+         self._persist_rules = persist_rules
+@@ -52,6 +80,8 @@ class Database:
+         self._pool: Any = None
+         self._queue: asyncio.Queue = asyncio.Queue(maxsize=queue_size)
+         self._worker: Optional[asyncio.Task] = None
++        self._alert_queue: asyncio.Queue = asyncio.Queue(maxsize=alert_queue_size)
++        self._alert_worker: Optional[asyncio.Task] = None
+ 
+     @property
+     def available(self) -> bool:
+@@ -69,6 +99,10 @@ class Database:
+             async with self._pool.acquire() as conn:
+                 for stmt in SCHEMA:
+                     await conn.execute(stmt)
++            await self._backfill_watchlist()
++            self._alert_worker = asyncio.create_task(
++                self._alert_writer(), name="alert-writer"
++            )
+             if self._persist_ticks:
+                 self._worker = asyncio.create_task(self._tick_worker(), name="tick-writer")
+         except Exception as exc:
+@@ -83,14 +117,29 @@ class Database:
+             except Exception:
+                 pass
+ 
++    async def _drain_alerts(self) -> None:
++        if self._alert_worker is None or self._alert_worker.done() or self._pool is None:
++            return
++        try:
++            await asyncio.wait_for(
++                self._alert_queue.join(), timeout=ALERT_DRAIN_TIMEOUT_SECONDS
++            )
++        except asyncio.TimeoutError:
++            log.warning("alert drain timed out; %d alert(s) unwritten", self._alert_queue.qsize())
++        except Exception as exc:
++            log.warning("alert drain failed: %s", type(exc).__name__)
++
+     async def close(self) -> None:
+-        worker, self._worker = self._worker, None
+-        if worker is not None:
+-            worker.cancel()
+-            try:
+-                await worker
+-            except (asyncio.CancelledError, Exception):
+-                pass
++        await self._drain_alerts()
++        for attr in ("_worker", "_alert_worker"):
++            worker = getattr(self, attr)
++            setattr(self, attr, None)
++            if worker is not None:
++                worker.cancel()
++                try:
++                    await worker
++                except (asyncio.CancelledError, Exception):
++                    pass
+         await self._close_pool()
+ 
+     # ---- ticks -------------------------------------------------------
+@@ -168,3 +217,133 @@ class Database:
+         async with pool.acquire() as conn:
+             rows = await conn.fetch("SELECT * FROM alert_rules")
+         return [Rule(**dict(r)) for r in rows]
++
++    async def create_rule_with_watchlist(self, rule: Rule, max_symbols: int) -> bool:
++        """Cap check + watchlist insert + rule insert in one transaction.
++
++        Returns True if the symbol was newly added to the watchlist. Raises
++        WatchlistFull when the symbol is new and the cap is reached.
++        """
++        pool = self._require_rules_pool()
++        async with pool.acquire() as conn:
++            async with conn.transaction():
++                await conn.execute("SELECT pg_advisory_xact_lock($1)", _WATCHLIST_LOCK_KEY)
++                exists = await conn.fetchval(
++                    "SELECT 1 FROM watchlist WHERE symbol = $1", rule.symbol
++                )
++                if not exists:
++                    count = await conn.fetchval("SELECT count(*) FROM watchlist")
++                    if count >= max_symbols:
++                        raise WatchlistFull("watchlist full")
++                result = await conn.execute(
++                    "INSERT INTO watchlist (symbol, created_at) VALUES ($1, $2) "
++                    "ON CONFLICT DO NOTHING",
++                    rule.symbol, rule.created_at,
++                )
++                await conn.execute(
++                    "INSERT INTO alert_rules (id, symbol, type, threshold, window_seconds, "
++                    "created_at) VALUES ($1,$2,$3,$4,$5,$6)",
++                    rule.id, rule.symbol, rule.type.value, rule.threshold,
++                    rule.window_seconds, rule.created_at,
++                )
++        return result.endswith(" 1")
++
++    async def load_watchlist(self) -> list[str]:
++        pool = self._require_rules_pool()
++        async with pool.acquire() as conn:
++            rows = await conn.fetch("SELECT symbol FROM watchlist ORDER BY symbol")
++        return [r["symbol"] for r in rows]
++
++    async def _backfill_watchlist(self) -> None:
++        """Idempotently watch symbols of rules that predate the watchlist table
++        (cap not applied). Never fails startup."""
++        if self._pool is None or not self._persist_rules:
++            return
++        try:
++            async with self._pool.acquire() as conn:
++                rows = await conn.fetch(
++                    "SELECT symbol, MIN(created_at) AS created_at FROM alert_rules "
++                    "GROUP BY symbol"
++                )
++                values = []
++                for r in rows:
++                    try:
++                        values.append((normalize_symbol(r["symbol"]), r["created_at"]))
++                    except ValueError:
++                        continue
++                if values:
++                    await conn.executemany(
++                        "INSERT INTO watchlist (symbol, created_at) VALUES ($1, $2) "
++                        "ON CONFLICT DO NOTHING",
++                        values,
++                    )
++        except Exception as exc:
++            log.error("watchlist backfill failed: %s", type(exc).__name__)
++
++    # ---- alerts ------------------------------------------------------
++    def enqueue_alert(self, alert: Alert) -> None:
++        """Non-blocking; no-op without a pool, drops the alert if the writer is behind."""
++        if self._pool is None:
++            return
++        try:
++            self._alert_queue.put_nowait(alert)
++        except asyncio.QueueFull:
++            log.warning("alert queue full; dropping alert for rule %s", alert.rule_id)
++
++    async def _alert_writer(self) -> None:
++        while True:
++            batch = [await self._alert_queue.get()]
++            while len(batch) < 200 and not self._alert_queue.empty():
++                batch.append(self._alert_queue.get_nowait())
++            rows = [
++                (a.id, a.rule_id, a.symbol, a.rule_type, a.threshold, a.price, a.triggered_at)
++                for a in batch
++            ]
++            sql = (
++                "INSERT INTO alerts (id, rule_id, symbol, rule_type, threshold, "
++                "price, triggered_at) VALUES ($1,$2,$3,$4,$5,$6,$7)"
++            )
++            failed = False
++            try:
++                try:
++                    async with self._pool.acquire() as conn:
++                        await conn.executemany(sql, rows)
++                except asyncio.CancelledError:
++                    raise
++                except Exception as exc:
++                    failed = True
++                    log.error("alert batch insert failed: %s", type(exc).__name__)
++                    # Retry row by row so one bad alert does not lose the rest.
++                    row_failures = 0
++                    last_exc: Optional[BaseException] = None
++                    for row in rows:
++                        try:
++                            async with self._pool.acquire() as conn:
++                                await conn.execute(sql, *row)
++                        except asyncio.CancelledError:
++                            raise
++                        except Exception as row_exc:
++                            row_failures += 1
++                            last_exc = row_exc
++                    if row_failures:
++                        log.error(
++                            "%d of %d alerts failed: %s",
++                            row_failures, len(rows), type(last_exc).__name__,
++                        )
++                    else:
++                        failed = False  # only the batch statement failed; rows recovered
++            finally:
++                for _ in batch:
++                    self._alert_queue.task_done()
++            if failed:
++                await asyncio.sleep(ALERT_FAILURE_BACKOFF_SECONDS)
++
++    async def list_alerts(self, limit: int = 50) -> list[Alert]:
++        pool = self._require_rules_pool()
++        async with pool.acquire() as conn:
++            rows = await conn.fetch(
++                "SELECT id, rule_id, symbol, rule_type, threshold, price, triggered_at "
++                "FROM alerts ORDER BY triggered_at DESC, id DESC LIMIT $1",
++                limit,
++            )
++        return [Alert(**dict(r)) for r in rows]
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 94b6739..2fbe517 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -11,13 +11,27 @@ from .config import Settings, get_settings
+ from .connection_manager import ConnectionManager
+ from .db import Database
+ from .finnhub_client import FinnhubClient
+-from .models import Tick
+-from .routers import health, rules as rules_router, symbols, ws
++from .models import Alert, Tick, normalize_symbol
++from .routers import alerts as alerts_router, health, rules as rules_router, symbols, ws
+ from .rules import RuleEngine, RuleStore
+ from .subscription_manager import SubscriptionManager
+ 
+ log = logging.getLogger(__name__)
+ 
++
++def _configure_logging() -> None:
++    """Make INFO records from app.* visible under uvicorn/docker. Idempotent;
++    adds a handler only if neither the app nor the root logger has one."""
++    app_log = logging.getLogger("app")
++    if app_log.level == logging.NOTSET or app_log.level > logging.INFO:
++        app_log.setLevel(logging.INFO)
++    if not app_log.handlers and not logging.getLogger().handlers:
++        handler = logging.StreamHandler()
++        handler.setFormatter(logging.Formatter("%(levelname)s:     %(name)s: %(message)s"))
++        app_log.addHandler(handler)
++        app_log.propagate = False  # do not print twice if root gains a handler later
++
++
+ # factory(settings, on_tick, get_symbols) -> object with async start/stop/subscribe/unsubscribe
+ UpstreamFactory = Callable[[Settings, Callable, Callable], Any]
+ 
+@@ -42,7 +56,11 @@ class Services:
+     def __init__(self, settings: Settings, db=None) -> None:
+         self.settings = settings
+         self.upstream: Any = None
+-        self._tasks: set[asyncio.Task] = set()
++        self.watchlist: set[str] = set()
++        # Serializes every upstream subscribe/unsubscribe decision + call so the
++        # last call reflects the latest state. Lock order: manager lock -> this.
++        self._upstream_lock = asyncio.Lock()
++        self._upstream_sent: set[str] = set()
+ 
+         self.db = db or Database(
+             settings.database_url,
+@@ -54,18 +72,64 @@ class Services:
+         self.rule_store = RuleStore(repo=self.db)
+         self.engine = RuleEngine(self.rule_store)
+ 
++    # Upstream set == watchlist UNION browser-held symbols. Every path (browser
++    # subscribe/unsubscribe, rule creation) changes its own state and then calls
++    # _reconcile, which compares what is wanted with what was actually sent
++    # (_upstream_sent) under one lock. Nobody defers to anybody, so no
++    # interleaving can leave a wanted symbol unsent or an unwanted one sent.
++    # _upstream_sent semantics: a successful subscribe adds, a successful
++    # unsubscribe removes; a failed subscribe is not recorded (retried by the
++    # next reconcile of that symbol) and a failed unsubscribe keeps the symbol
++    # recorded (so a failed unsubscribe is retried, and a re-want sends nothing).
++    # On every (re)connect FinnhubClient resubscribes the wanted set via
++    # _symbols_for_connect, which resets the sent set to exactly that set.
++    def _wanted(self, symbol: str) -> bool:
++        return symbol in self.watchlist or self.subscriptions.ref_count(symbol) > 0
++
++    async def _reconcile(self, symbol: str) -> None:
++        async with self._upstream_lock:
++            if self.upstream is None:
++                return
++            wanted = self._wanted(symbol)
++            sent = symbol in self._upstream_sent
++            if wanted and not sent:
++                try:
++                    await self.upstream.subscribe(symbol)
++                except Exception as exc:
++                    log.warning("upstream subscribe failed for %s: %s", symbol, type(exc).__name__)
++                else:
++                    self._upstream_sent.add(symbol)
++            elif sent and not wanted:
++                try:
++                    await self.upstream.unsubscribe(symbol)
++                except Exception as exc:
++                    log.warning("upstream unsubscribe failed for %s: %s", symbol, type(exc).__name__)
++                else:
++                    self._upstream_sent.discard(symbol)
++
+     async def _up_subscribe(self, symbol: str) -> None:
+-        if self.upstream is not None:
+-            await self.upstream.subscribe(symbol)
++        await self._reconcile(symbol)
+ 
+     async def _up_unsubscribe(self, symbol: str) -> None:
+-        if self.upstream is not None:
+-            await self.upstream.unsubscribe(symbol)
+-
+-    def _spawn(self, coro) -> None:
+-        task = asyncio.create_task(coro)
+-        self._tasks.add(task)
+-        task.add_done_callback(self._tasks.discard)
++        await self._reconcile(symbol)
++
++    async def watch_symbol(self, symbol: str) -> None:
++        """Rule path: mark the symbol watched and reconcile upstream (one
++        subscribe if nothing sent it yet). Upstream failure is logged only."""
++        if symbol in self.watchlist:
++            return
++        self.watchlist.add(symbol)
++        await self._reconcile(symbol)
++
++    def upstream_symbols(self) -> list[str]:
++        return sorted(self.watchlist | set(self.subscriptions.active_symbols()))
++
++    def _symbols_for_connect(self) -> list[str]:
++        """get_symbols callable for the upstream client: it resubscribes this
++        set on every (re)connect, so the sent set becomes exactly the wanted set."""
++        wanted = self.upstream_symbols()
++        self._upstream_sent = set(wanted)
++        return wanted
+ 
+     async def on_tick(self, tick: Tick) -> None:
+         """Ingestion path. Everything before the broadcast is non-blocking."""
+@@ -80,6 +144,16 @@ class Services:
+                     event.get("threshold"),
+                     event.get("price"),
+                 )
++                self.db.enqueue_alert(
++                    Alert(
++                        rule_id=rule.id,
++                        symbol=rule.symbol,
++                        rule_type=event["rule_type"],
++                        threshold=rule.threshold,
++                        price=event["price"],
++                        triggered_at=event["triggered_at"],
++                    )
++                )
+         except Exception:
+             log.exception("tick side-effects failed")
+         try:
+@@ -99,15 +173,18 @@ class Services:
+     async def startup(self, factory: UpstreamFactory) -> None:
+         await self.db.connect()
+         await self.rule_store.load()
+-        self.upstream = factory(self.settings, self.on_tick, self.subscriptions.active_symbols)
++        try:
++            self.watchlist = {normalize_symbol(s) for s in await self.db.load_watchlist()}
++        except Exception as exc:
++            log.warning("loading watchlist failed: %s", type(exc).__name__)
++            self.watchlist = set()
++        self.upstream = factory(self.settings, self.on_tick, self._symbols_for_connect)
+         if self.upstream is not None:
+             await self.upstream.start()
+ 
+     async def shutdown(self) -> None:
+         if self.upstream is not None:
+             await self.upstream.stop()
+-        for task in list(self._tasks):
+-            task.cancel()
+         await self.db.close()
+ 
+ 
+@@ -116,6 +193,7 @@ def create_app(
+     upstream_factory: Optional[UpstreamFactory] = None,
+     db=None,
+ ) -> FastAPI:
++    _configure_logging()
+     settings = settings or get_settings()
+     factory = upstream_factory or default_upstream_factory
+ 
+@@ -139,6 +217,7 @@ def create_app(
+     app.include_router(health.router)
+     app.include_router(symbols.router)
+     app.include_router(rules_router.router)
++    app.include_router(alerts_router.router)
+     app.include_router(ws.router)
+     return app
+ 
+diff --git a/backend/app/models.py b/backend/app/models.py
+index 48d85f1..ebf0521 100644
+--- a/backend/app/models.py
++++ b/backend/app/models.py
+@@ -52,3 +52,15 @@ class RuleCreate(BaseModel):
+ class Rule(RuleCreate):
+     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+     created_at: float = Field(default_factory=time.time)
++
++
++class Alert(BaseModel):
++    """A fired rule. Stores its own rule_type/threshold so it outlives the rule."""
++
++    id: str = Field(default_factory=lambda: uuid.uuid4().hex)
++    rule_id: str
++    symbol: str
++    rule_type: str
++    threshold: float
++    price: float
++    triggered_at: float
+diff --git a/backend/app/routers/rules.py b/backend/app/routers/rules.py
+index 73a7897..6ba1045 100644
+--- a/backend/app/routers/rules.py
++++ b/backend/app/routers/rules.py
+@@ -3,6 +3,7 @@ from typing import Optional
+ 
+ from fastapi import APIRouter, HTTPException, Query, Request, Response
+ 
++from ..db import WatchlistFull
+ from ..models import Rule, RuleCreate, normalize_symbol
+ 
+ log = logging.getLogger(__name__)
+@@ -21,10 +22,15 @@ async def create_rule(data: RuleCreate, request: Request) -> Rule:
+     services = request.app.state.services
+     rule = Rule(**data.model_dump())
+     try:
+-        await services.db.save_rule(rule)
++        await services.db.create_rule_with_watchlist(
++            rule, services.settings.watchlist_max_symbols
++        )
++    except WatchlistFull:
++        raise HTTPException(status_code=409, detail="watchlist full")
+     except Exception as exc:
+         raise _unavailable("save", exc)
+     services.rule_store.put(rule)
++    await services.watch_symbol(rule.symbol)
+     return rule
+ 
+ 
+diff --git a/backend/app/rules.py b/backend/app/rules.py
+index e9f0357..c6e0d57 100644
+--- a/backend/app/rules.py
++++ b/backend/app/rules.py
+@@ -6,7 +6,7 @@ import time
+ from collections import deque
+ from typing import Any
+ 
+-from .models import Rule, RuleCreate, RuleType, Tick
++from .models import Rule, RuleType, Tick
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -35,12 +35,6 @@ class RuleStore:
+     def discard(self, rule_id: str) -> None:
+         self._rules.pop(rule_id, None)
+ 
+-    async def add(self, data: RuleCreate) -> Rule:
+-        """In-memory only helper (no persistence)."""
+-        rule = Rule(**data.model_dump())
+-        self.put(rule)
+-        return rule
+-
+     def for_symbol(self, symbol: str) -> list[Rule]:
+         return [r for r in self._rules.values() if r.symbol == symbol]
+ 
+diff --git a/backend/tests/fakes/fake_db.py b/backend/tests/fakes/fake_db.py
+index bc800bf..6622319 100644
+--- a/backend/tests/fakes/fake_db.py
++++ b/backend/tests/fakes/fake_db.py
+@@ -1,14 +1,17 @@
+ """In-memory stand-in for app.db.Database (rule methods only)."""
+ from typing import Optional
+ 
+-from app.db import DatabaseUnavailable
+-from app.models import Rule
++from app.db import DatabaseUnavailable, WatchlistFull
++from app.models import Alert, Rule
+ 
+ 
+ class FakeDatabase:
+     def __init__(self, failing: bool = False) -> None:
+         self.failing = failing
+         self.rules: dict[str, Rule] = {}
++        self.watchlist: set[str] = set()
++        self.alerts: list[Alert] = []
++        self.enqueue_error: Optional[Exception] = None
+ 
+     @property
+     def available(self) -> bool:
+@@ -31,6 +34,29 @@ class FakeDatabase:
+         self._check()
+         self.rules[rule.id] = rule
+ 
++    async def create_rule_with_watchlist(self, rule: Rule, max_symbols: int) -> bool:
++        self._check()
++        new = rule.symbol not in self.watchlist
++        if new and len(self.watchlist) >= max_symbols:
++            raise WatchlistFull("watchlist full")
++        self.watchlist.add(rule.symbol)
++        self.rules[rule.id] = rule
++        return new
++
++    async def load_watchlist(self) -> list[str]:
++        self._check()
++        return sorted(self.watchlist)
++
++    def enqueue_alert(self, alert: Alert) -> None:
++        if self.enqueue_error is not None:
++            raise self.enqueue_error
++        self.alerts.append(alert)
++
++    async def list_alerts(self, limit: int = 50) -> list[Alert]:
++        self._check()
++        rows = sorted(self.alerts, key=lambda a: (a.triggered_at, a.id), reverse=True)
++        return rows[:limit]
++
+     async def delete_rule(self, rule_id: str) -> bool:
+         self._check()
+         return self.rules.pop(rule_id, None) is not None
+diff --git a/backend/tests/test_connection_manager.py b/backend/tests/test_connection_manager.py
+index 8b3444e..3f2df6c 100644
+--- a/backend/tests/test_connection_manager.py
++++ b/backend/tests/test_connection_manager.py
+@@ -16,7 +16,7 @@ class FakeWS:
+         self.sent.append(msg)
+ 
+ 
+-async def test_broadcast_reaches_all_and_drops_failed():
++async def test_send_to_drops_failed_connection():
+     gone = []
+ 
+     async def on_disc(cid):
+@@ -28,12 +28,12 @@ async def test_broadcast_reaches_all_and_drops_failed():
+     bid = await mgr.connect(bad)
+     assert good.accepted and len(mgr) == 2
+ 
+-    await mgr.broadcast({"x": 1})  # must not raise
++    await mgr.send_to([gid, bid], {"x": 1})  # must not raise
+     assert good.sent == [{"x": 1}]
+-    assert mgr.connection_ids == [gid]
++    assert len(mgr) == 1
+     assert gone == [bid]
+ 
+-    await mgr.broadcast({"x": 2})
++    await mgr.send_to([gid, bid], {"x": 2})
+     assert good.sent == [{"x": 1}, {"x": 2}]
+ 
+ 
+diff --git a/backend/tests/test_rules_engine.py b/backend/tests/test_rules_engine.py
+index 7256382..3e5bea9 100644
+--- a/backend/tests/test_rules_engine.py
++++ b/backend/tests/test_rules_engine.py
+@@ -1,4 +1,4 @@
+-from app.models import RuleCreate, Tick
++from app.models import Rule, Tick
+ from app.rules import RuleEngine, RuleStore
+ 
+ 
+@@ -9,7 +9,7 @@ def tick(price, t=0, symbol="AAPL"):
+ async def setup(*rules):
+     store = RuleStore()
+     for r in rules:
+-        await store.add(RuleCreate(symbol="AAPL", **r))
++        store.put(Rule(symbol="AAPL", **r))
+     return store, RuleEngine(store)
+ 
+ 
+@@ -70,7 +70,8 @@ async def test_store_load_swallows_errors_and_does_not_persist():
+     store = RuleStore(repo=BrokenRepo())
+     await store.load()  # must not raise; store stays empty
+     assert store.for_symbol("AAPL") == []
+-    rule = await store.add(RuleCreate(symbol="aapl", type="price_above", threshold=1))
++    rule = Rule(symbol="aapl", type="price_above", threshold=1)
++    store.put(rule)
+     assert store.for_symbol("AAPL") == [rule] and rule.symbol == "AAPL"
+     store.discard(rule.id)
+     store.discard(rule.id)
+diff --git a/backend/tests/test_rules_postgres.py b/backend/tests/test_rules_postgres.py
+index 97020b6..ce87b09 100644
+--- a/backend/tests/test_rules_postgres.py
++++ b/backend/tests/test_rules_postgres.py
+@@ -1,18 +1,20 @@
+ """Real-Postgres tests for rule persistence.
+ 
+ Set TEST_DATABASE_URL to a DISPOSABLE database: these tests DROP the
+-`alert_rules` and `ticks` tables before and after every test.
++`alert_rules`, `ticks`, `watchlist` and `alerts` tables before and after every test.
+ """
++import asyncio
+ import os
++import time
+ 
+ import asyncpg
+ import pytest
+ from fastapi.testclient import TestClient
+ 
+ from app.config import Settings
+-from app.db import Database, DatabaseUnavailable
++from app.db import Database, DatabaseUnavailable, WatchlistFull
+ from app.main import create_app
+-from app.models import Rule, Tick
++from app.models import Alert, Rule, Tick
+ from tests.fakes.fake_finnhub import FakeFinnhubClient
+ 
+ URL = os.environ.get("TEST_DATABASE_URL", "")
+@@ -31,11 +33,19 @@ async def _exec(*statements: str):
+         await conn.close()
+ 
+ 
++_DROPS = (
++    "DROP TABLE IF EXISTS alert_rules",
++    "DROP TABLE IF EXISTS ticks",
++    "DROP TABLE IF EXISTS watchlist",
++    "DROP TABLE IF EXISTS alerts",
++)
++
++
+ @pytest.fixture(autouse=True)
+ async def clean_tables():
+-    await _exec("DROP TABLE IF EXISTS alert_rules", "DROP TABLE IF EXISTS ticks")
++    await _exec(*_DROPS)
+     yield
+-    await _exec("DROP TABLE IF EXISTS alert_rules", "DROP TABLE IF EXISTS ticks")
++    await _exec(*_DROPS)
+ 
+ 
+ @pytest.fixture
+@@ -144,3 +154,152 @@ def test_restart_reloads_rules_and_engine_fires():
+         assert rid in services.rule_store
+         fired = services.engine.evaluate(Tick(symbol="AAPL", price=101.0, ts_ms=1))
+         assert [rule.id for rule, _ in fired] == [rid]
++
++
++# ---- watchlist / alerts (T008) ------------------------------------------
++async def _fetch(sql: str, *args):
++    conn = await asyncpg.connect(URL)
++    try:
++        return await conn.fetch(sql, *args)
++    finally:
++        await conn.close()
++
++
++async def _wait_for(predicate, timeout=5.0):
++    loop = asyncio.get_running_loop()
++    end = loop.time() + timeout
++    while loop.time() < end:
++        result = await predicate()
++        if result:
++            return result
++        await asyncio.sleep(0.02)
++    raise AssertionError("condition not met in time")
++
++
++def _alert(id="a1", t=10.0, rule_id="r1"):
++    return Alert(id=id, rule_id=rule_id, symbol="AAPL", rule_type="price_above",
++                 threshold=100.0, price=101.5, triggered_at=t)
++
++
++async def test_schema_has_watchlist_alerts_index_and_no_fk(db):
++    tables = {r["table_name"] for r in await _fetch(
++        "SELECT table_name FROM information_schema.tables WHERE table_schema='public'")}
++    assert {"watchlist", "alerts"} <= tables
++    idx = await _fetch("SELECT indexdef FROM pg_indexes WHERE tablename='alerts'")
++    assert any("triggered_at DESC" in r["indexdef"] for r in idx)
++    fks = await _fetch("SELECT 1 FROM pg_constraint WHERE contype='f'")
++    assert fks == []
++    d2 = Database(URL, persist_ticks=False)  # second startup does not error
++    await d2.connect()
++    assert d2.available
++    await d2.close()
++
++
++async def test_create_rule_rolls_back_watchlist_on_rule_failure(db):
++    r = _rule()
++    assert await db.create_rule_with_watchlist(r, 5) is True
++    dup = _rule("MSFT")
++    dup.id = r.id  # forces the alert_rules INSERT to fail
++    with pytest.raises(Exception):
++        await db.create_rule_with_watchlist(dup, 5)
++    assert await db.load_watchlist() == ["AAPL"]
++    assert await db.create_rule_with_watchlist(_rule(), 5) is False
++
++
++async def test_cap_enforced_in_db(db):
++    await db.create_rule_with_watchlist(_rule("A"), 2)
++    await db.create_rule_with_watchlist(_rule("B"), 2)
++    with pytest.raises(WatchlistFull):
++        await db.create_rule_with_watchlist(_rule("C"), 2)
++    await db.create_rule_with_watchlist(_rule("A"), 2)
++    assert await db.load_watchlist() == ["A", "B"]
++    assert len(await db.list_rules(None, 50)) == 3
++
++
++async def test_concurrent_creations_at_cap_minus_one(db):
++    await db.create_rule_with_watchlist(_rule("A"), 2)
++    results = await asyncio.gather(
++        db.create_rule_with_watchlist(_rule("B"), 2),
++        db.create_rule_with_watchlist(_rule("C"), 2),
++        return_exceptions=True,
++    )
++    assert sum(r is True for r in results) == 1
++    assert sum(isinstance(r, WatchlistFull) for r in results) == 1
++    assert len(await db.load_watchlist()) == 2
++
++
++async def test_alert_worker_persists_and_survives_failure(db):
++    a = _alert("a1", 10.0)
++    db.enqueue_alert(a)
++
++    async def got(n):
++        rows = await db.list_alerts(50)
++        return rows if len(rows) >= n else None
++
++    rows = await _wait_for(lambda: got(1))
++    assert rows[0] == a
++    db.enqueue_alert(_alert("a1", 11.0))  # duplicate id: insert fails
++    db.enqueue_alert(_alert("a2", 12.0))
++    rows = await _wait_for(lambda: got(2))
++    assert [x.id for x in rows] == ["a2", "a1"]
++
++
++async def test_alerts_survive_rule_deletion_via_api():
++    body = {"symbol": "AAPL", "type": "price_above", "threshold": 100}
++    with TestClient(_app()) as c:
++        rid = c.post("/api/rules", json=body).json()["id"]
++        db = c.app.state.services.db
++        db.enqueue_alert(_alert("a1", 10.0, rule_id=rid))
++        deadline = time.time() + 5
++        while time.time() < deadline and not c.get("/api/alerts").json():
++            time.sleep(0.02)
++        assert c.delete(f"/api/rules/{rid}").status_code == 204
++        got = c.get("/api/alerts").json()
++        assert len(got) == 1
++        assert got[0]["rule_id"] == rid and got[0]["rule_type"] == "price_above"
++        assert got[0]["threshold"] == 100.0
++
++
++def test_restart_reloads_watchlist_and_subscribes():
++    body = {"symbol": "aapl", "type": "price_above", "threshold": 100}
++    with TestClient(_app()) as c:
++        assert c.post("/api/rules", json=body).status_code == 201
++        assert FakeFinnhubClient.instances[0].subscribed == ["AAPL"]
++    with TestClient(_app()) as c:
++        up = FakeFinnhubClient.instances[0]
++        assert c.app.state.services.watchlist == {"AAPL"}
++        assert "AAPL" in up.get_symbols()
++
++
++async def test_preexisting_rule_backfilled_into_watchlist():
++    await _exec(
++        "CREATE TABLE alert_rules ("
++        "id TEXT PRIMARY KEY, symbol TEXT NOT NULL, type TEXT NOT NULL, "
++        "threshold DOUBLE PRECISION NOT NULL, window_seconds DOUBLE PRECISION, "
++        "created_at DOUBLE PRECISION NOT NULL)",
++        "INSERT INTO alert_rules VALUES ('old','MSFT','price_above',1,NULL,5)",
++        "INSERT INTO alert_rules VALUES ('old2','msft','price_below',1,NULL,6)",
++    )
++    d = Database(URL, persist_ticks=False)
++    await d.connect()
++    try:
++        assert await d.load_watchlist() == ["MSFT"]
++    finally:
++        await d.close()
++    d2 = Database(URL, persist_ticks=False)  # idempotent
++    await d2.connect()
++    try:
++        assert await d2.load_watchlist() == ["MSFT"]
++    finally:
++        await d2.close()
++
++
++def test_api_cap_409_with_real_db():
++    FakeFinnhubClient.instances.clear()
++    settings = Settings(_env_file=None, finnhub_api_key="", database_url=URL,
++                        watchlist_max_symbols=1)
++    app = create_app(settings, upstream_factory=FakeFinnhubClient.factory)
++    with TestClient(app) as c:
++        assert c.post("/api/rules", json={"symbol": "A", "type": "price_above", "threshold": 1}).status_code == 201
++        assert c.post("/api/rules", json={"symbol": "B", "type": "price_above", "threshold": 1}).status_code == 409
++        assert [r["symbol"] for r in c.get("/api/rules").json()] == ["A"]
+diff --git a/frontend/src/api/client.ts b/frontend/src/api/client.ts
+index 34f4cdb..39d4655 100644
+--- a/frontend/src/api/client.ts
++++ b/frontend/src/api/client.ts
+@@ -46,3 +46,18 @@ export function wsUrl(): string {
+   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+   return `${scheme}://${window.location.host}/ws`;
+ }
++
++export interface Alert {
++  id: string;
++  rule_id: string;
++  symbol: string;
++  rule_type: string;
++  threshold: number;
++  price: number;
++  triggered_at: number;
++}
++
++export async function listAlerts(limit = 50): Promise<Alert[]> {
++  const res = await check(await fetch(`${base}/api/alerts?limit=${limit}`));
++  return res.json();
++}
+diff --git a/frontend/src/components/Dashboard.tsx b/frontend/src/components/Dashboard.tsx
+index 93d1f83..a5505dc 100644
+--- a/frontend/src/components/Dashboard.tsx
++++ b/frontend/src/components/Dashboard.tsx
+@@ -1,6 +1,7 @@
+ import { useCallback, useEffect, useState } from "react";
+ import { wsUrl } from "../api/client";
+ import { useWebSocket } from "../hooks/useWebSocket";
++import AlertList from "./AlertList";
+ import PriceTicker from "./PriceTicker";
+ import RuleForm from "./RuleForm";
+ import RuleList from "./RuleList";
+@@ -51,6 +52,7 @@ export default function Dashboard() {
+       <h2>Alert rules</h2>
+       <RuleForm onCreated={() => setRulesVersion((v) => v + 1)} />
+       <RuleList version={rulesVersion} />
++      <AlertList />
+     </div>
+   );
+ }

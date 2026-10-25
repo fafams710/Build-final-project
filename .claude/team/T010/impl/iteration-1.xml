@@ -1,0 +1,64 @@
+<implementation>
+  <iteration>1</iteration>
+  <files>
+    <file path="backend/app/security.py">NEW: key_matches (compare_digest on UTF-8 bytes), require_api_key dependency (401 identical body), KeyMaskFilter, idempotent install_key_mask</file>
+    <file path="backend/app/config.py">app_api_key setting with generation comment</file>
+    <file path="backend/app/main.py">lifespan first-statement APP_API_KEY check (log.error "startup failed: APP_API_KEY is not set..." + RuntimeError); install_key_mask in create_app; Depends(require_api_key) on symbols/rules/alerts routers only</file>
+    <file path="backend/app/routers/ws.py">before accept: Origin (if present) must be in cors_origin_list and ?key= must match, else close(1008) and return</file>
+    <file path="backend/tests/conftest.py">TEST_KEY/AUTH constants; settings and client_no_db carry the key; clients send X-API-Key by default</file>
+    <file path="backend/tests/test_auth.py">NEW: 29 tests (config, startup, REST 401/200 per route, preflight, /health, ws accept/reject, no-key-in-app-logs, masking filter)</file>
+    <file path="backend/tests/test_api_symbols.py">ws URLs use ?key=; own TestClient sends header</file>
+    <file path="backend/tests/test_watchlist_alerts.py">key in Settings, headers on direct TestClients, ws URLs use ?key=</file>
+    <file path="backend/tests/test_rules_postgres.py">key in Settings and headers on TestClients</file>
+    <file path="frontend/src/api/client.ts">getApiKey/setApiKey/clearApiKey (sessionStorage "apiKey"), onUnauthorized, X-API-Key on every call, 401 clears key and notifies, wsUrl appends ?key=/&amp;key= encoded</file>
+    <file path="frontend/src/components/Dashboard.tsx">KeyPrompt + DashboardContent (old body) + thin Dashboard gate that re-checks on 401</file>
+    <file path="frontend/tests/Dashboard.test.tsx">beforeEach stores key, afterEach clears sessionStorage</file>
+    <file path="frontend/tests/ApiKey.test.tsx">NEW: 7 tests (prompt, header incl. Content-Type, blank Save, ws url encoding, &amp; join, 401 clears+closes socket, 500 keeps key)</file>
+    <file path="frontend/vite.config.ts">server.host "localhost"; proxy default http://127.0.0.1:8000 (orchestrator resolution)</file>
+    <file path="docker-compose.yml">127.0.0.1 port mappings (postgres 5433:5432, backend 8000, frontend 5173); backend APP_API_KEY with :? check</file>
+    <file path=".env.example">APP_API_KEY= with generation comment; 127.0.0.1 in DATABASE_URL and TEST_DATABASE_URL; 5433 vs 5432 note; CORS_ORIGINS dashboard-origin note</file>
+    <file path="README.md">Quick start with APP_API_KEY, 127.0.0.1 bindings, new Authentication section (curl/Invoke-RestMethod, /ws?key=), API table row</file>
+  </files>
+  <tests>
+    <test>FAIL BEFORE: with only conftest key + new tests (no implementation), backend offline run: 24 failed, 98 passed, 19 skipped (test_auth: ImportError-free but REST 200 not 401, ws not rejected, no startup failure, no app.security). Frontend: 6 failed, 6 passed (ApiKey.test.tsx).</test>
+    <test>PASS AFTER offline: 122 passed, 19 skipped (skips are the real-Postgres file).</test>
+    <test>PASS AFTER real Postgres (throwaway PG17, port 55511, trust auth, temp dir outside repo, -rs): 141 passed, 0 skipped. Cluster stopped and directory deleted.</test>
+    <test>Frontend: npm test 12 passed (3 files); npm run build OK.</test>
+  </tests>
+  <commands_run>
+    <command>python -X faulthandler -m pytest -o faulthandler_timeout=120 (before and after)</command>
+    <command>initdb/pg_ctl/createdb PG17 on 55511; TEST_DATABASE_URL=... pytest -rs; pg_ctl stop; rm -rf cluster</command>
+    <command>npx vitest run (before); npm test; npm run build</command>
+    <command>real run: python -m uvicorn app.main:app --port 8765 (random key, DB = throwaway PG), driven by a websockets/urllib script in the scratchpad; second run with APP_API_KEY empty on port 8766</command>
+  </commands_run>
+  <log_masking_evidence>
+    Key was random token_urlsafe(16)+"+/=" (so the percent-encoded form differs from raw). Captured stdout+stderr: raw key hits 0, quote(safe="") hits 0, default-quote hits 0. Exact lines:
+      INFO:     127.0.0.1:59398 - "WebSocket /ws?key=***" [accepted]
+      INFO:     127.0.0.1:59399 - "WebSocket /ws?key=***" 403          (wrong key)
+      INFO:     127.0.0.1:59400 - "WebSocket /ws?key=***" 403          (bad Origin, good key)
+      INFO:     127.0.0.1:59401 - "GET /api/rules?key=*** HTTP/1.1" 200 OK
+      INFO:     127.0.0.1:59402 - "GET /api/rules?key=*** HTTP/1.1" 401 Unauthorized
+    Client results: good ws got subscribed reply; wrong key and bad Origin both "HTTP 403" handshake rejection; REST with header 200, without 401.
+    No-key run: exit code 3, log line "ERROR:     app.main: startup failed: APP_API_KEY is not set; generate one with python -c "import secrets; print(secrets.token_urlsafe(32))" and put it in .env", then RuntimeError and "Application startup failed. Exiting." The mechanism works as the spec predicted (uvicorn creates its handlers before importing app.main). Not tested with --reload.
+  </log_masking_evidence>
+  <design_decisions>
+    <decision>require_api_key reads the header via request.headers (not a Header() param) and the key from app.state.services.settings; rejected a closed-over settings so the dependency has no coupling to create_app.</decision>
+    <decision>Mask filter is a single KeyMaskFilter installed on uvicorn, uvicorn.error, uvicorn.access and app loggers and their existing handlers, updating the secret on an existing instance instead of stacking; rejected a LogRecord factory (global side effect) since the real run proved the handler walk works.</decision>
+    <decision>Filter masks every `[?&]key=value` generically plus the literal key in raw and two percent-encoded forms; short keys would also be replaced anywhere in logs, accepted (real keys are 43 chars).</decision>
+    <decision>Missing APP_API_KEY in lifespan raises RuntimeError("APP_API_KEY is not set") after log.error; independent of RULES_PERSISTENCE_ENABLED. create_app() itself never raises.</decision>
+    <decision>Dashboard gate uses a module-level listener set (onUnauthorized) rather than a window event; KeyPrompt is a form so Enter also saves.</decision>
+    <decision>.env.example VITE_BACKEND_URL left as http://localhost:8000 (orchestrator said override unchanged); only the vite.config default changed.</decision>
+  </design_decisions>
+  <deviations>
+    While editing I accidentally truncated backend/tests/test_api_symbols.py (python open('w') evaluated before read) and recreated it in full from the content I had read earlier; git diff now shows only the intended 8 insertions / 5 deletions, so content is identical apart from the edits. No git state-changing commands were used.
+    Tests count: test_auth.py has parametrized cases (more than the criteria list); the "no state change" check uses rule_store.for_symbol.
+    /docs, /redoc, /openapi.json remain open as instructed.
+  </deviations>
+  <claude_md_should_say>
+    API: every /api/* route requires header X-API-Key (shared secret APP_API_KEY, secrets.compare_digest, 401 {"detail":"invalid or missing API key"}); /health is open. /ws requires query key= and an Origin (when present) listed in CORS_ORIGINS, otherwise it is closed with 1008 before accept. Startup fails loudly in lifespan ("startup failed: APP_API_KEY is not set") when the key is empty, independent of RULES_PERSISTENCE_ENABLED; create_app() itself stays callable without a key. app/security.py holds the dependency and KeyMaskFilter, which masks key= in uvicorn/app logs. Compose publishes postgres 127.0.0.1:5433, backend 127.0.0.1:8000, frontend 127.0.0.1:5173; vite server.host is localhost and the proxy targets 127.0.0.1:8000. Frontend keeps the key in sessionStorage, prompts when absent, clears it on 401. Invariant: secrets (including APP_API_KEY) come from .env only and never appear in logs. Tests: TEST_KEY/AUTH in tests/conftest.py, clients send the header, ws tests use /ws?key=TEST_KEY.
+  </claude_md_should_say>
+  <blocked_reason>none</blocked_reason>
+  <self_critique>
+    Least covered: vite proxy forwarding the Origin on /ws (A6) and --reload behaviour of the log filter, neither run. The Origin check is exact-string, so opening the dashboard at 127.0.0.1:5173 is rejected unless added to CORS_ORIGINS (documented). The wrong-key ws reconnect loop in the browser relies on a REST 401 to stop it.
+  </self_critique>
+</implementation>

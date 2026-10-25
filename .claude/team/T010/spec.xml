@@ -1,0 +1,199 @@
+<spec>
+  <!-- T010: shared API key (option B), websocket Origin + key, localhost-only bindings. Baseline dde2e39. No commits / branch changes. -->
+
+  <user_stories>
+    - As the owner, I want every /api/* call to require a shared secret so that anything that can reach the port cannot read or change my rules and alerts.
+    - As the owner, I want the browser websocket to refuse foreign origins and wrong/missing keys so a web page on another site cannot subscribe through my backend.
+    - As the owner, I want the backend to refuse to start without a key so I cannot accidentally run it open.
+    - As the owner, I want the key never to appear in logs, even though it travels in the /ws query string.
+    - As a dashboard user, I want to enter the key once per browser session and be asked again if it is rejected.
+    - As the owner, I want Postgres, the API and the dashboard published on 127.0.0.1 only, so they are not exposed on the LAN.
+  </user_stories>
+
+  <design>
+    <!-- Grounded in current code; the implementer picks exact code shape. -->
+    <item id="D1" name="setting">
+      config.py `Settings`: add `app_api_key: str = ""` (env APP_API_KEY). .env.example: `APP_API_KEY=` with comment
+      "generate: python -c "import secrets; print(secrets.token_urlsafe(32))"". Empty/whitespace-only counts as unset.
+    </item>
+    <item id="D2" name="fail-loud startup">
+      In main.py `create_app().lifespan`, FIRST statement, before `Services(settings, db=db)` is built: if
+      `not settings.app_api_key.strip()`, `log.error("startup failed: APP_API_KEY is not set; generate one with ...")` and raise
+      RuntimeError. Nothing is built, connected or started (no Database.connect, no upstream factory call, no worker).
+      Must be in lifespan, NOT in `create_app()` and not at import: `main.py` ends with module-level `app = create_app()` and
+      test_app_logger_info_and_idempotent_handlers calls `create_app()` with no settings; both must keep working with no key.
+      Interaction with RULES_PERSISTENCE_ENABLED=false: key required regardless (check precedes and is independent of the
+      persistence branch in `Services._load_state`). The log line contains the setting name only, never any key value.
+    </item>
+    <item id="D3" name="REST auth dependency">
+      New small module (e.g. app/security.py) with `async def require_api_key(request: Request) -> None` (or a `Header(None, alias="X-API-Key")`
+      parameter defaulting to None so a missing header is never a 422). It reads the expected key from
+      `request.app.state.services.settings.app_api_key`, or from the `settings` closed over in create_app, compares with
+      `secrets.compare_digest` on UTF-8 bytes (str compare_digest raises on non-ASCII), and raises
+      `HTTPException(401, "invalid or missing API key")` for both missing and wrong (identical body, no hint).
+      Attached once in main.py `create_app()` via `app.include_router(<r>.router, dependencies=[Depends(require_api_key)])`
+      for exactly the three /api routers: `symbols.router` (/api/symbols), `rules_router.router` (/api/rules),
+      `alerts_router.router` (/api/alerts). `health.router` and `ws.router` are included WITHOUT it. Handlers are untouched.
+      FastAPI runs router dependencies before body validation: an unauthenticated POST /api/rules with an invalid body must give 401, not 422.
+      CORS: CORSMiddleware is added before routers and answers preflight (OPTIONS + Origin + Access-Control-Request-Method)
+      itself, so the dependency is never reached; `allow_headers=["*"]` already covers X-API-Key. No change to CORS config.
+    </item>
+    <item id="D4" name="ws gate">
+      routers/ws.py `ws_endpoint`: before `svc.connections.connect(websocket)` (which calls `websocket.accept()`), run the check:
+      (a) `origin = websocket.headers.get("origin")`; if origin is not None and origin not in `settings.cors_origin_list`
+      (exact string match against the list, as CORS does; the literal "null" Origin is therefore rejected) -> reject;
+      (b) `key = websocket.query_params.get("key")`; if key is None or not compare_digest(key, expected) -> reject.
+      Reject = `await websocket.close(code=1008)` then `return`, with no accept and no ConnectionManager/SubscriptionManager side effect
+      (Starlette answers the handshake with HTTP 403). Same behaviour for every failure reason; no reason text in the close.
+      Absent Origin is allowed only when the key matches. Expected key and origin list come from
+      `websocket.app.state.services.settings` (already how ws.py reaches `svc`). Starlette TestClient surfaces the rejection as
+      `WebSocketDisconnect` with `.code == 1008` raised from `websocket_connect`.
+    </item>
+    <item id="D5" name="log masking">
+      Add a `logging.Filter` subclass (in the new security module or main.py) that rewrites the formatted record: for `record.msg` and every
+      str in `record.args` (tuple or dict) it replaces `key=<value>` in query strings (regex like `([?&]key=)[^&\s"']+` -> `\1***`) and also
+      replaces any literal occurrence of the configured key and its `urllib.parse.quote` form with `***`. It masks for ANY key value (valid, wrong, empty-ish), not just the real one.
+      It always returns True (never drops records). Install from `create_app()` next to `_configure_logging()`, idempotently (do not stack duplicate filters
+      on repeated create_app calls; test_app_logger_info_and_idempotent_handlers calls it twice), on
+      loggers `uvicorn`, `uvicorn.error`, `uvicorn.access` AND on every handler already attached to those loggers
+      (logger-level filters do not apply to records propagated from child loggers, handler-level filters do).
+      Also attach to the `app` logger/handlers it owns.
+      Why this works under `uvicorn app.main:app` and in docker: uvicorn's Config.__init__ runs `logging.config.dictConfig` (creating the
+      `uvicorn`, `uvicorn.error`, `uvicorn.access` loggers and their handlers) BEFORE it imports `app.main`, and the module-level
+      `app = create_app()` therefore runs after the handlers exist; docker uses the same CMD. Records that carry the path:
+      access line `"%s - "%s %s HTTP/%s" %d"` (path arg, from uvicorn.access) and websocket lines `%s - "WebSocket %s" [accepted]` / `... 403` (from uvicorn.error).
+      Implementer must verify with a real `uvicorn app.main:app` run (see AC-12). If the pinned uvicorn installs handlers lazily so that the
+      handler walk at create_app time misses them, fall back to a LogRecord factory wrapper or re-install in lifespan startup (still idempotent);
+      requirement is the observable result, not the mechanism.
+      The filter must also leave the real key out of the app's own logs: nothing in app code may log the key, the headers or the ws URL.
+    </item>
+    <item id="D6" name="frontend client.ts">
+      Export `getApiKey()/setApiKey(k)/clearApiKey()` over `sessionStorage` (key name e.g. "apiKey"). Every fetch in listRules, createRule, deleteRule,
+      listAlerts adds header `X-API-Key` (merge with the existing Content-Type header in createRule). `check()` on status 401: `clearApiKey()`, notify
+      listeners (small subscribe/onUnauthorized mechanism or window event), then throw as today. `wsUrl()` appends `key=<encodeURIComponent(key)>` using `?`
+      or `&` depending on whether the (possibly VITE_WS_URL-configured) URL already has a query string.
+    </item>
+    <item id="D7" name="Dashboard gate">
+      Hooks cannot be called conditionally, and the current Dashboard calls `useWebSocket(wsUrl(), ...)` unconditionally (which would open /ws without a key).
+      So: rename the current component body to an inner component (same file, e.g. `DashboardContent`) and make default-export `Dashboard` a thin gate:
+      no stored key -> render a `KeyPrompt` (label "API key", `type="password"` input, "Save" button; Save stores the key and renders the content);
+      key present -> render `DashboardContent`. On the 401 notification Dashboard re-reads state, so the content unmounts (closing the websocket via useWebSocket cleanup)
+      and the prompt shows again. Minimal markup, existing plain-element style, no new dependencies.
+    </item>
+    <item id="D8" name="bindings and docs">
+      docker-compose.yml: postgres ports `"127.0.0.1:5433:5432"`, backend `"127.0.0.1:8000:8000"`, frontend `"127.0.0.1:5173:5173"`; backend env adds
+      `APP_API_KEY: ${APP_API_KEY:?set APP_API_KEY in .env}`. Nothing else changes (compose-internal DATABASE_URL still uses postgres:5432).
+      vite.config.ts `server.host: "localhost"` (the container CLI flag `--host 0.0.0.0` in frontend/Dockerfile overrides the config in docker, so docker still works).
+      .env.example: DATABASE_URL and TEST_DATABASE_URL example use 127.0.0.1; comment: compose Postgres is on host port 5433, a local install usually 5432
+      (the DATABASE_URL default stays on 5432 as written by the request; the comment tells compose-host users to use 5433); comment that the dashboard must be opened at an origin listed in CORS_ORIGINS.
+      README: set APP_API_KEY (generation command), dashboard prompts for it, curl and Invoke-RestMethod examples with `-H "X-API-Key: ..."`, ports bound to 127.0.0.1, Postgres on 5433, `/ws?key=` note; fix the stale Quick start ("copy and set FINNHUB_API_KEY, POSTGRES_PASSWORD" -> also APP_API_KEY).
+    </item>
+  </design>
+
+  <acceptance_criteria>
+    <!-- Backend: pytest, fake DB, shared TEST_KEY constant. -->
+    1. Config. `Settings(_env_file=None).app_api_key == ""`; with env APP_API_KEY=abc it is "abc". Test: monkeypatch.setenv. .env.example contains an `APP_API_KEY=` line and the generation command (grep).
+    2. No-key startup fails. For each of key "" and "   ": `with TestClient(create_app(settings_without_key, upstream_factory=FakeFinnhubClient.factory, db=FakeDatabase())): pass` raises; caplog has an ERROR containing "startup failed" and "APP_API_KEY"; `FakeFinnhubClient.instances == []`; the fake db was never connected (assert connect not invoked, close_calls == 0). Also holds with rules_persistence_enabled=False. Caplog text never contains a key value.
+    3. Import/creation unaffected. `create_app()` with no settings and no key does not raise (existing test_app_logger_info_and_idempotent_handlers still passes).
+    4. REST requires key. For GET /api/rules, POST /api/rules (valid body), DELETE /api/rules/x, GET /api/alerts, GET /api/symbols: no header -> 401 and wrong header -> 401, body exactly {"detail": "invalid or missing API key"} and identical for missing vs wrong; correct header -> normal status (200/201/404/200/200). Unauthenticated POST with an INVALID body still 401 (not 422). Non-ASCII wrong key -> 401 (no 500).
+    5. No state change without key. After 401 on POST /api/rules, fake_db.rules and rule_store are unchanged.
+    6. /health open: GET /health without header -> 200 {"status":"ok"}.
+    7. Preflight: `OPTIONS /api/rules` with headers Origin=http://localhost:5173, Access-Control-Request-Method=POST, Access-Control-Request-Headers=x-api-key (no key) -> 200 and Access-Control-Allow-Origin == the origin and x-api-key in Access-Control-Allow-Headers.
+    8. /ws accept: `websocket_connect("/ws?key=TEST_KEY")` without Origin header works (subscribe/subscribed round trip), and with Origin=http://localhost:5173 works.
+    9. /ws reject: each of (bad Origin http://evil.example + good key; Origin "null" + good key; good Origin + wrong key; good Origin + no key; no Origin + no key; no Origin + wrong key; key= empty) makes `websocket_connect` raise WebSocketDisconnect with code 1008. After a rejection `app.state.services.connections` has no entry and `subscriptions.active_symbols()` is empty; upstream fake saw no subscribe.
+    10. Key never logged by the app: with caplog at DEBUG over a rejected and an accepted ws connect and a 401 and a 200 REST call, `TEST_KEY` is not in caplog.text.
+    11. Masking filter unit test: feed a LogRecord shaped like uvicorn's access line (msg `'%s - "%s %s HTTP/%s" %d'`, args ("127.0.0.1:1", "GET", "/ws?key=SECRET%2Bx&a=1", "1.1", 403)) and an error-logger line (`'%s - "WebSocket %s" [accepted]'`) through the installed filter via a handler on logger `uvicorn.access` / `uvicorn.error`: rendered output contains "key=***" and `&a=1`, not "SECRET". Filter returns True. Calling create_app() twice leaves exactly one such filter per logger/handler.
+    12. Real uvicorn run (manual/scripted by implementer, report evidence, then kill the process): start `uvicorn app.main:app --port <free>` from backend/ with APP_API_KEY=<random>, DATABASE_URL pointing at the throwaway PG (or RULES_PERSISTENCE_ENABLED=false), capture stdout+stderr. Make: a successful ws connect (key good), a rejected ws connect (key wrong), and a REST call. Grep the captured log for the random key and for its URL-encoded form: zero matches; the log does show `key=***` lines. Also run once with APP_API_KEY unset and confirm uvicorn exits non-zero with the "startup failed: APP_API_KEY is not set" message. (Docker is not available; the CMD is the same `uvicorn app.main:app`, so the same mechanism applies.)
+    13. Existing suite updated (see tests_that_change) and green offline: `python -X faulthandler -m pytest -o faulthandler_timeout=120`.
+    14. Real-Postgres suite green with TEST_DATABASE_URL on the throwaway PG17 cluster (port 55511, trust auth, temp dir outside repo): 0 skipped; cluster stopped and deleted afterwards.
+
+    <!-- Frontend: vitest, mocked fetch/WebSocket/sessionStorage. -->
+    15. No stored key: render(<Dashboard/>) shows the password input (getByLabelText "API key", type=password) and Save; no fetch call was made and no MockWebSocket was constructed; the rules form is absent.
+    16. Save: typing a key and clicking Save stores it in sessionStorage, shows the dashboard (e.g. "Alert rules" heading), and the next fetch calls carry header X-API-Key == key (GET /api/rules, GET /api/alerts, and the POST in the create-rule flow, which also keeps Content-Type).
+    17. WebSocket URL: with a stored key containing characters like `a+b/c=&`, the MockWebSocket url ends with `/ws?key=` + encodeURIComponent(key); with VITE_WS_URL already containing `?x=1` it appends `&key=...`.
+    18. 401 handling: with a stored key and fetch mocked to return {ok:false,status:401}, after the dashboard loads sessionStorage no longer has the key and the key prompt is shown again; the websocket was closed (MockWebSocket.readyState==3).
+    19. Non-401 errors (500) do not clear the key.
+    20. `npm test` and `npm run build` pass.
+
+    <!-- Config / infra: checked by file inspection. -->
+    21. docker-compose.yml contains exactly the three 127.0.0.1 port mappings above, the APP_API_KEY `:?` line, and no other diff (git diff reviewed). vite.config.ts has `host: "localhost"`. .env.example uses 127.0.0.1 in both URLs, documents 5433 vs 5432 and the CORS_ORIGINS/dashboard-origin rule. README covers the items in D8. `docker compose config` is not runnable (Docker absent): inspected by eye only.
+    22. Hygiene: no `git commit/push/stash/checkout/switch/restore/reset`; `.env` not read into any output or edited; CLAUDE.md untouched; no python/node/postgres processes left running.
+  </acceptance_criteria>
+
+  <tests_that_change>
+    - backend/tests/conftest.py: add module constant `TEST_KEY = "test-key"` (importable as tests.conftest.TEST_KEY or put in tests/fakes); `settings` fixture adds `app_api_key=TEST_KEY`; `client_no_db` Settings adds it; `client` fixture builds `TestClient(app, headers={"X-API-Key": TEST_KEY})`; same for client_no_db. Why: lifespan now raises without a key and every /api call needs the header.
+    - backend/tests/test_api_rules.py: no edits expected (uses `client`/`client_no_db`, which now carry the header). Verify header default applies to GET/POST/DELETE.
+    - backend/tests/test_api_symbols.py: every `websocket_connect("/ws")` becomes `"/ws?key=" + TEST_KEY` (a TestClient default header does not supply a query param); its own `TestClient(create_app(settings, ...))` (test_single_upstream_started_and_stopped_once) must pass the header/default headers; `client.get("/api/symbols")` needs the header.
+    - backend/tests/test_watchlist_alerts.py: `small_client` Settings and its TestClient (key + header); test_startup_opt_out_starts_empty_and_503 (Settings + TestClient header); test_no_upstream_rule_creation_works and test_factory_receives_union_callable, test_startup_skips_bad_rule_row_and_bad_watchlist_symbol, test_startup_skips_bad_watchlist_symbol_with_fake_db (they build `TestClient(app)` directly: add headers=, and ws URLs get ?key=); all `websocket_connect("/ws")` calls (test_browser_holding_symbol..., test_enqueue_failure_does_not_stop_broadcast, test_factory_receives_union_callable); `_failing_start` uses `settings` fixture so it keeps working (error still contains "startup failed", db.close_calls still 1 for DB failures). `_services()` builds Services directly with no lifespan: unchanged. test_settings_default_and_env, test_app_logger_info_and_idempotent_handlers (create_app() with no key must not raise): unchanged.
+    - backend/tests/test_rules_postgres.py: its Settings(...) + create_app + TestClient usages (about 19 matches of create_app/Settings/TestClient/websocket) get the key and header; pure Database tests unchanged. Runs only with TEST_DATABASE_URL.
+    - New tests (new file backend/tests/test_auth.py is the natural home): AC 1-11. Use raw `TestClient(app)` without default headers for the unauthenticated cases.
+    - frontend/tests/Dashboard.test.tsx: beforeEach must `sessionStorage.setItem("apiKey", "test-key")` (and clear in afterEach), otherwise Dashboard renders only the prompt and both existing tests fail; the existing fetch mock call signature `(_url, init)` still works (headers added to init). Add tests for AC 15-19 (same file or new frontend/tests/ApiKey.test.tsx; vitest `include` is tests/**/*.test.tsx).
+    - frontend/tests/AlertList.test.tsx: renders AlertList alone with a mocked fetch; check whether it asserts on `fetch` call args (e.g. toHaveBeenCalledWith(url) without init) and update if so; otherwise unchanged.
+  </tests_that_change>
+
+  <assumptions>
+    - A1: Key is compared as UTF-8 bytes with secrets.compare_digest; surrounding whitespace in the configured key is not trimmed when comparing (but an all-whitespace key counts as unset). pydantic-settings already strips nothing, so a key with trailing space in .env would have to be typed with it; acceptable and documented only if it surfaces.
+    - A2: /docs, /redoc and /openapi.json stay open (not under /api/*, request says "every /api/* route" + /health open). Flagged as risk, not changed.
+    - A3: Unknown /api/* paths (404) are not authenticated (a router dependency only covers real routes); they reveal nothing.
+    - A4: Origin check is an exact string match against `cors_origin_list`; no case folding or trailing-slash normalisation (browsers send scheme://host[:port] without slash). CORS_ORIGINS entries with a trailing slash would not match; documented, not handled.
+    - A5: Existing non-ASCII-safe behaviour: wrong non-ASCII key -> 401, never 500.
+    - A6: The dashboard keeps using relative URLs through the Vite proxy; no frontend change for Origin (the browser sends Origin http://localhost:5173 and vite's ws proxy forwards it unchanged since `changeOrigin` is not set; do not add changeOrigin).
+    - A7: `.env.example` DATABASE_URL keeps port 5432 (request says only swap localhost for 127.0.0.1 and add the 5433 comment).
+  </assumptions>
+
+  <conflicts_and_ambiguities>
+    <!-- Each: issue, then chosen resolution. -->
+    1. "Lifespan raises ... nothing started" vs module-level `app = create_app()` and tests that call create_app() keyless: resolved by checking only inside lifespan, first statement, before Services().
+    2. Request says log masking must work "under uvicorn" but logger vs handler filter semantics differ and uvicorn configures logging before importing the app: resolved by installing on loggers AND their handlers, idempotently, from create_app, with a real-run verification (AC-12) and a stated fallback.
+    3. Request says TestClient fixtures send the key, but a default header does not cover the /ws query string: all ws tests are edited to add `?key=`; the fixture header only covers REST.
+    4. Dashboard calls `useWebSocket` unconditionally, so "show prompt first" cannot be a simple early return (and would open an unauthenticated /ws): resolved with a gate component plus inner component.
+    5. A ws reconnect loop with a wrong stored key: useWebSocket cannot see the 1008 reason, it just retries with backoff. Resolution: leave the hook as is; a REST 401 clears the key and unmounts the content (stops the loop). Accepted limitation; not adding ws-close-code handling (browser gets only a generic failure on pre-accept rejection anyway).
+    6. Request says "OPTIONS preflight works without the key": no code needed because CORSMiddleware short-circuits real preflights; a bare OPTIONS without CORS headers falls through to the route (405) and is not protected or required. Test only the real preflight form.
+    7. vite proxy target defaults to http://localhost:8000 while backend is bound to 127.0.0.1 (uvicorn default host): on a machine where localhost resolves to ::1 first the proxy could fail. Not in the request; leaving vite.config.ts proxy default unchanged (only server.host is requested). Flagged as a risk; .env.example VITE_BACKEND_URL stays http://localhost:8000 unless the user asks (suggest 127.0.0.1).
+    8. `server.host: "localhost"` makes `npm run dev` unreachable from other machines but the Dockerfile CLI `--host 0.0.0.0` overrides it, so in-container behaviour is unchanged and exposure is controlled by the 127.0.0.1 compose mapping.
+    9. README "Quick start" already lists the dashboard at http://localhost:5173: that remains an allowed origin (CORS default); opening it at http://127.0.0.1:5173 would be rejected on /ws (and by CORS) unless added to CORS_ORIGINS. Documented in .env.example and README.
+    10. CLAUDE.md invariants mention nothing about auth and say "Do not reintroduce browser websockets"; the browser ws still exists (M5 removal is out of scope). No conflict, but CLAUDE.md text needs an update (listed below).
+  </conflicts_and_ambiguities>
+
+  <edge_cases>
+    - Key containing URL-special characters (+ / = & % space) round-trips through encodeURIComponent and Starlette's query decoding.
+    - Key with non-ASCII characters (compare_digest on str would raise TypeError): compare bytes.
+    - Header present but empty -> 401. Duplicate X-API-Key headers: first value wins (framework behaviour), no 500.
+    - Origin header present with a good key but not in list -> 1008; Origin missing with bad key -> 1008.
+    - Rejected ws handshake must not allocate a connection id or touch subscriptions.
+    - 401 responses carry no hint (same body for missing vs wrong) and are not logged with the supplied value.
+    - Masking applies to wrong keys as well as the right one, and to percent-encoded forms and `key=` anywhere in the query (first or later parameter).
+    - create_app called many times in one process (tests) must not stack filters.
+    - Key prompt: empty/whitespace Save does nothing; a stored key surviving a page reload within the session but cleared on tab close (sessionStorage semantics).
+    - 401 arriving from several concurrent dashboard requests (RuleList and AlertList both fetch) must clear and show the prompt once without throwing unhandled rejections beyond the existing error behaviour.
+    - Startup with RULES_PERSISTENCE_ENABLED=false and no key still fails.
+  </edge_cases>
+
+  <risks>
+    <risk severity="medium">Log masking depends on uvicorn's logging setup (loggers/handlers, version pinned in requirements.txt); the only reliable proof is the real uvicorn run in AC-12. Other leak paths: browser devtools/history, any reverse proxy access log in front (not present), and the Vite dev server if it ever logs ws URLs.</risk>
+    <risk severity="medium">Key in the ws query string is inherently leak-prone (user chose it, Q1=1). Mitigated only by masking and localhost-only bindings.</risk>
+    <risk severity="medium">Wide test churn: every ws test and every directly constructed TestClient needs the key; a missed one fails with 401/1008, easy to spot but numerous.</risk>
+    <risk severity="low">Shared single key is all-or-nothing, no rotation, no rate limiting (brute force) by design (out of scope).</risk>
+    <risk severity="low">/docs and /openapi.json stay unauthenticated and list the API surface (A2).</risk>
+    <risk severity="low">Vite proxy default localhost vs 127.0.0.1-bound backend on IPv6-first resolvers (conflict 7).</risk>
+    <risk severity="low">A user who already has a `.env` without APP_API_KEY (the orchestrator adds an empty line) gets a deliberate startup failure until they set one; compose refuses to start with the `:?` message. Intended (Q2=1).</risk>
+  </risks>
+
+  <dependencies>
+    - No new packages. Python stdlib `secrets`, `logging`, `re`, `urllib.parse`; existing FastAPI/Starlette TestClient, pytest, asyncpg; frontend vitest/jsdom/@testing-library/react already present.
+    - Files touched: backend/app/config.py, backend/app/main.py, backend/app/routers/ws.py, one new small backend module for the dependency + log filter, backend/tests/*, frontend/src/api/client.ts, frontend/src/components/Dashboard.tsx (+ KeyPrompt in same file or one new component), frontend/tests/*, frontend/vite.config.ts, docker-compose.yml, .env.example, README.md.
+    - PG17 binaries at C:/Program Files/PostgreSQL/17/bin for the real-DB run.
+  </dependencies>
+
+  <out_of_scope>
+    The user's real .env (orchestrator adds the empty APP_API_KEY= line); Docker runs; removing browser websockets (M5) and routers/symbols.py; rate limiting / brute-force protection; accounts, JWT, key rotation or hashing the stored key; authenticating /docs, /redoc, /openapi.json; changing useWebSocket reconnect logic; vite proxy target change; CLAUDE.md edits (orchestrator); any git state change or commit; other known issues.
+  </out_of_scope>
+
+  <claude_md_should_say>
+    Project/API: every /api/* route requires header X-API-Key (shared secret APP_API_KEY, compared with secrets.compare_digest, 401 {"detail":"invalid or missing API key"}); /health is open. /ws requires query `key=` and an Origin (when present) listed in CORS_ORIGINS, otherwise closes with 1008 before accept. Startup fails loudly (lifespan, "startup failed: APP_API_KEY is not set") when the key is empty, independent of RULES_PERSISTENCE_ENABLED. A logging filter masks `key=` in uvicorn logs; never log the key. Compose publishes postgres on 127.0.0.1:5433, backend 127.0.0.1:8000, frontend 127.0.0.1:5173; Vite server.host is localhost. Frontend keeps the key in sessionStorage, prompts when absent, clears it on 401. Invariant to add: secrets (including APP_API_KEY) come from .env only and never appear in logs. Tests: settings fixture carries TEST_KEY; ws tests use /ws?key=TEST_KEY; create_app() itself must stay callable without a key (only lifespan enforces it).
+  </claude_md_should_say>
+
+  <self_critique>
+    Every user story maps to criteria: REST auth (4-7), ws (8-9), fail-loud (2-3), log masking (10-12), dashboard prompt (15-19), bindings (21). Criteria 12 and 21 depend on manual evidence rather than automated tests (real uvicorn, no Docker). The largest remaining uncertainty is the exact point at which uvicorn's handlers exist relative to create_app on the pinned uvicorn version and with --reload; the spec names the fallback and demands real-run proof. A second uncertainty is whether TestClient default headers propagate to websocket_connect, which is why ws auth tests rely on the query param and explicit headers only. AlertList.test.tsx was not inspected in detail; the implementer must check it.
+  </self_critique>
+</spec>

@@ -1,0 +1,73 @@
+<implementation>
+  <iteration>1</iteration>
+  <files>
+    <file path=".env.example">placeholders for every env var</file>
+    <file path=".gitignore">ignores .env*, node_modules, caches (keeps .env.example)</file>
+    <file path="docker-compose.yml">redis, timescaledb, backend, frontend wired by env</file>
+    <file path=".github/workflows/ci.yml">backend (redis+timescaledb services, pytest) and frontend (build, test) jobs</file>
+    <file path="backend/app/config.py">pydantic-settings Settings from env/.env</file>
+    <file path="backend/app/models.py">Tick, Rule, RuleCreate (validated), symbol normalization</file>
+    <file path="backend/app/subscription_manager.py">ref-counted subscriptions, upstream calls only on 0-1 / 1-0</file>
+    <file path="backend/app/connection_manager.py">browser socket tracking, per-subset send, drop on failure</file>
+    <file path="backend/app/finnhub_client.py">single upstream client, backoff reconnect, resubscribe from ref-count set</file>
+    <file path="backend/app/redis_cache.py">best-effort last-price cache</file>
+    <file path="backend/app/db.py">best-effort asyncpg rules + hypertable tick persistence via bounded queue</file>
+    <file path="backend/app/rules.py">in-memory RuleStore and edge-triggered RuleEngine</file>
+    <file path="backend/app/webhooks.py">HMAC-SHA256 signed httpx POST with bounded retries, non-raising</file>
+    <file path="backend/app/main.py">create_app, Services wiring, lifespan owns the one upstream</file>
+    <file path="backend/app/routers/ws.py">browser /ws subscribe/unsubscribe + cache snapshot</file>
+    <file path="backend/app/routers/rules.py">rules create/list/delete REST</file>
+    <file path="backend/app/routers/symbols.py">active symbols and cached price REST</file>
+    <file path="backend/app/routers/health.py">/health</file>
+    <file path="backend/app/__init__.py">empty</file>
+    <file path="backend/app/routers/__init__.py">empty</file>
+    <file path="backend/requirements.txt">python deps</file>
+    <file path="backend/Dockerfile">uvicorn image</file>
+    <file path="backend/pytest.ini">asyncio auto mode, pythonpath</file>
+    <file path="backend/tests/__init__.py">empty</file>
+    <file path="backend/tests/conftest.py">settings/fake cache/recording webhooks/client fixtures</file>
+    <file path="backend/tests/fakes/fake_finnhub.py">FakeUpstream (connect stub) and FakeFinnhubClient</file>
+    <file path="backend/tests/test_connection_manager.py">broadcast, failure drop, idempotent disconnect</file>
+    <file path="backend/tests/test_subscription_manager.py">ref-count, idempotency, disconnect, reconnect resubscribe</file>
+    <file path="backend/tests/test_rules_engine.py">edge trigger, window percent, multi-rule, persistence errors</file>
+    <file path="backend/tests/test_webhooks.py">signature validity, retries, non-blocking, static secret scan</file>
+    <file path="backend/tests/test_api_symbols.py">single upstream lifecycle, fan-out, snapshot, rule fire end-to-end</file>
+    <file path="backend/tests/test_api_rules.py">rules CRUD and validation</file>
+    <file path="frontend/package.json">deps and scripts (build, test)</file>
+    <file path="frontend/vite.config.ts">react plugin, proxy, vitest jsdom config</file>
+    <file path="frontend/index.html">entry html</file>
+    <file path="frontend/Dockerfile">dev server image</file>
+    <file path="frontend/src/main.tsx">bootstrap</file>
+    <file path="frontend/src/App.tsx">root component</file>
+    <file path="frontend/src/api/client.ts">rules REST client and ws url</file>
+    <file path="frontend/src/hooks/useWebSocket.ts">reconnecting websocket hook</file>
+    <file path="frontend/src/components/Dashboard.tsx">watch list, live prices, rules UI composition</file>
+    <file path="frontend/src/components/SymbolSubscribe.tsx">add-symbol form</file>
+    <file path="frontend/src/components/PriceTicker.tsx">price list with remove</file>
+    <file path="frontend/src/components/RuleForm.tsx">create rule form</file>
+    <file path="frontend/src/components/RuleList.tsx">list/delete rules</file>
+    <file path="frontend/tests/Dashboard.test.tsx">vitest: subscribe/tick/remove and rule create</file>
+  </files>
+  <tests>
+    <test>backend pytest: 27 passed offline (no network, no credentials)</test>
+    <test>frontend vitest: 2 passed; npm run build succeeds</test>
+  </tests>
+  <commands_run>
+    <command>pip install -r requirements.txt; python -m pytest -q (backend)</command>
+    <command>npm install; npm run build; npm test (frontend)</command>
+  </commands_run>
+  <design_decisions>
+    <decision>Ref-count derived from per-symbol connection sets (not an integer counter) so it cannot drift or go negative; rejected a separate counter.</decision>
+    <decision>ConnectionManager takes an on_disconnect callback wired to SubscriptionManager.disconnect so failed sends also release subscriptions; rejected cleanup only in ws handler.</decision>
+    <decision>Upstream injected via factory(settings, on_tick, get_symbols) in create_app; with no FINNHUB_API_KEY the default factory returns None (no connection) rather than looping against a rejecting server.</decision>
+    <decision>Tick persistence uses a bounded queue plus background batch writer that drops on overflow; rejected awaiting inserts in the tick path.</decision>
+    <decision>Webhook header is X-Signature-256 = sha256=hex(HMAC(secret, raw body)); body is canonical compact sorted JSON.</decision>
+    <decision>Percent-change rule compares against the oldest in-window price from tick timestamps; history only kept for symbols with rules.</decision>
+    <decision>Frontend uses npm install in CI (no lockfile committed) and no tsconfig since vite build uses esbuild; rejected adding files not in the spec list.</decision>
+    <decision>Secret static scan lives in test_webhooks.py rather than a new test file, to stay within the file list.</decision>
+  </design_decisions>
+  <blocked_reason>none</blocked_reason>
+  <self_critique>
+    Real asyncpg/Redis/TimescaleDB paths (db.py, redis_cache.py) are not exercised by tests since they need live services; SQL and hypertable creation are unverified. Real websockets.connect framing is only covered via the fake. Reconnect backoff reset happens on successful connect only. No tsc type-check is run in CI.
+  </self_critique>
+</implementation>

@@ -1,0 +1,36 @@
+<verification>
+  <iteration>2</iteration>
+  <verdict>fail</verdict>
+  <criteria>
+    <criterion id="1" result="PASS">Offline: 89 passed, 18 skipped. Throwaway PG17 (initdb trust, temp dir outside repo, port 55499): 107 passed, 0 skipped. Cluster stopped (pg_ctl stop) and directory deleted.</criterion>
+    <criterion id="2" result="PASS">Copy of backend in a temp dir with baseline-2 db.py/main.py/rules.py and the current tests: test_watchlist_alerts.py 7 failed, 49 passed (all 7 new tests); test_rules_postgres.py::test_startup_skips_malformed_rule_and_watchlist_rows failed (log "startup failed: loading rules/watchlist: ValidationError"), 17 passed. On current code all pass.</criterion>
+    <criterion id="3" result="PASS (docker part unverified)">docker-compose.yml diff vs baseline-2 is exactly one line: healthcheck now "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-ticks}"; defaults unchanged. Docker is not installed here, so compose was not run. No docker-entrypoint.sh exists locally, so the official image behaviour (init server listening on unix socket only, listen_addresses='') is UNVERIFIED by me. pg_isready -h 127.0.0.1 works against the throwaway cluster.</criterion>
+    <criterion id="4" result="PASS (one low bug)">Real uvicorn + local fake ws, dummy key; every case exit 3, no ws CONNECT. (a) closed port: "app.db: database connect/setup failed: ConnectionRefusedError: [WinError 1225] ..." / "app.main: startup failed: Postgres unavailable: ConnectionRefusedError: ...; set RULES_PERSISTENCE_ENABLED=false to run without it". (b) empty URL: "startup failed: Postgres unavailable: DATABASE_URL is empty; set ..." (no db line). (c) scram user, wrong password: "InvalidPasswordError: password authentication failed for user "pwuser"" on both lines. (c2) missing database: InvalidCatalogNameError: database "nodb_zz" does not e***ist (see bug 2). (d) watchlist table without created_at + one alert_rules row: "UndefinedColumnError: column "created_at" does not exist" on both lines (prefix reads "Postgres unavailable:" though the cause is schema; cause is named). grep of all five logs for the passwords, "postgresql://", host:port: 0 hits.</criterion>
+    <criterion id="5" result="FAIL">Rows via SQL in alert_rules: ok1 AAPL valid; bad1 TSLA threshold -1; bad2 NVDA type 'nope'; bad3 symbol 'bad symbol!'; watchlist MSFT + 'BAD SYMBOL!'. Server started (Application startup complete). WARNINGs: backfill skipping 'bad symbol!'; malformed rule row id=bad1/bad2/bad3 with reason; malformed watchlist symbol 'BAD SYMBOL!'. Upstream got exactly one subscribe each for AAPL, MSFT, NVDA, TSLA (NVDA/TSLA via per-symbol backfill, as documented); 'BAD SYMBOL!' / 'bad symbol!' never subscribed. All bad rows still in Postgres. Alert fired for ok1 and GET /api/alerts returned it. BUT GET /api/rules returned 503 {"detail":"rule storage unavailable"} with log "rule list failed: ValidationError" (see bug 1), so "GET /api/rules returns only valid rules" is not met. A dropped-column case (alert_rules.symbol dropped) still fails startup loudly with UndefinedColumnError (via the backfill query; the load_rules query-error path is covered only by the offline test, which passes).</criterion>
+    <criterion id="6" result="PASS">Clean DB: POST /api/rules IBM price_above 100 -> 201; exactly one upstream {"type":"subscribe","symbol":"IBM"}; rule fired; alerts table 1 row; GET /api/alerts returned it; GET /api/rules returned the rule.</criterion>
+    <criterion id="7" result="PASS">My fake-ws python (PID 34624) killed, uvicorn runs timed out/killed, PG cluster (postmaster 46876) stopped, temp dirs removed; remaining tasklist entries are only the pre-existing Services-session pg_ctl 4696 and postgres.exe processes. git log -1 = 68afb62. git status: 22 entries, identical to the initial snapshot (includes revised-planning.md). No state-changing git command run.</criterion>
+  </criteria>
+  <test_results>
+    <result>python -X faulthandler -m pytest -o faulthandler_timeout=120 -> 89 passed, 18 skipped</result>
+    <result>same with TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55499/t009v -> 107 passed, 0 skipped</result>
+    <result>baseline-2 app code + current tests -> 7 + 1 new tests fail (expected)</result>
+  </test_results>
+  <runtime_check result="yes">Real uvicorn against local fake Finnhub ws and throwaway PG17; scenarios 4a-4d, 5, 6 as above.</runtime_check>
+  <bugs>
+    <bug>
+      <description>With a malformed row in alert_rules (skipped with a warning at startup), GET /api/rules returns 503 "rule storage unavailable" permanently, because Database.list_rules builds Rule objects without the skip logic and ValidationError propagates. The app starts but the rules endpoint is unusable until the row is removed by hand. The implementer flagged this as out of scope; the verification request expects GET /api/rules to return only valid rules.</description>
+      <reproduction>Throwaway PG with schema created, then: INSERT INTO alert_rules VALUES ('bad1','TSLA','price_above',-1,NULL,2), ('ok1','AAPL','price_above',100,NULL,1); start uvicorn app.main:app with that DATABASE_URL; curl http://127.0.0.1:PORT/api/rules -> 503; log "app.routers.rules: rule list failed: ValidationError".</reproduction>
+      <severity>medium</severity>
+      <owner>implementer</owner>
+    </bug>
+    <bug>
+      <description>Error-text scrubbing replaces every occurrence of the password string, so a short password corrupts the logged message (password "x": 'database "nodb_zz" does not e***ist'). No secret leaks; message readability suffers only with very short passwords.</description>
+      <reproduction>DATABASE_URL=postgresql://postgres:x@127.0.0.1:PORT/nodb_zz; start the server; see the "does not e***ist" in the app.db and app.main lines.</reproduction>
+      <severity>low</severity>
+      <owner>implementer</owner>
+    </bug>
+  </bugs>
+  <self_critique>
+    Not tested: docker compose and the real postgres image entrypoint. Windows only. The load_rules query-error path on a real server was exercised only through the backfill query (the load_rules path itself is covered by an offline test). Scram auth tested only for the wrong-password case.
+  </self_critique>
+</verification>

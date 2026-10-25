@@ -1,0 +1,36 @@
+<implementation>
+  <iteration>1</iteration>
+  <files>
+    <file path="backend/app/db.py">4 constants (command 5, acquire 5, startup 30, health 2); timeout= on all 12 pool.acquire sites; command_timeout on create_pool; new Database.ping()</file>
+    <file path="backend/app/main.py">Services._load_state wraps new _load_state_unbounded in wait_for(db_module.DB_STARTUP_TIMEOUT_SECONDS); one "startup failed: Postgres setup timed out after Ns; set RULES_PERSISTENCE_ENABLED=false..." line, raises RuntimeError; inner load handler re-raises TimeoutError first</file>
+    <file path="backend/app/routers/health.py">/health returns {status, database, upstream}; 503 only when database down; reads app.state.services; ping bounded by HEALTH_DB_TIMEOUT_SECONDS</file>
+    <file path="backend/tests/fakes/fake_db.py">ping() with ping_calls/ping_error/ping_hang</file>
+    <file path="backend/tests/fakes/fake_finnhub.py">connected attribute (default False)</file>
+    <file path="backend/tests/test_auth.py">test_health_open expects new 3-field body (degraded/ok/disconnected)</file>
+    <file path="backend/tests/test_watchlist_alerts.py">two stub acquire() accept timeout=None</file>
+    <file path="backend/tests/test_health_timeouts.py">NEW: health (criteria 1-7), acquire/command kwargs (8), request-path 503 for query timeout / acquire timeout / acquire hang (9,10), startup timeout (11), writer resilience + non-blocking on_tick (12)</file>
+    <file path="backend/tests/test_rules_postgres.py">2 new real-PG tests: table-lock gives 503 within 3 s then recovers (13); /health ok then down after pool close (14)</file>
+  </files>
+  <tests>
+    <test>Fail-before (new tests, old app code): offline 28 failed / 133 passed / 19 skipped (all health tests, constants, acquire kwarg, create_pool kwarg, acquire_hang request, both startup-timeout cases); real PG: both new tests failed (19 passed). Writer tests and query_timeout/acquire_timeout request tests passed before: they assert existing behaviour.</test>
+    <test>After: offline 161 passed, 21 skipped. Real PG17 (port 55531, trust): 182 passed, 0 skipped.</test>
+  </tests>
+  <commands_run>
+    <command>python -X faulthandler -m pytest -o faulthandler_timeout=120 (offline, before and after)</command>
+    <command>initdb/pg_ctl start/createdb on PG17 in scratchpad, TEST_DATABASE_URL pytest, pg_ctl stop, rm -rf data dir; pg_isready confirms nothing listening</command>
+  </commands_run>
+  <design_decisions>
+    <decision>Startup: inner coroutine _load_state_unbounded + thin wait_for wrapper, rather than indenting the body; TimeoutError from queries re-raised in the inner handler so only one fixed-text line is logged.</decision>
+    <decision>ping() bounded both inside (wait_for) and in the router (wait_for), so FakeDatabase hangs are bounded too.</decision>
+    <decision>Request-timeout tests use httpx ASGITransport with outer asyncio.wait_for (rather than sync TestClient) so a regression fails instead of hanging.</decision>
+    <decision>Pre-existing client_no_db fixture injects a fake upstream, so its /health is database disabled, upstream disconnected, degraded (spec criterion 3 said upstream disabled; tested the no-upstream variant separately via factory returning None).</decision>
+  </design_decisions>
+  <deviations>
+    Only criterion 3 wording (above). Health router returns JSONResponse instead of a response model. Routers unchanged. Stray scratchpad PG data dir deleted; no process left.
+  </deviations>
+  <claude_md_text>
+    API: "GET /health is open (no key) and returns {status, database, upstream}; database ok|down|disabled (disabled = RULES_PERSISTENCE_ENABLED=false), upstream connected|disconnected|disabled (disabled = no Finnhub key); HTTP 503 only when database is down." Invariant 5: "Every database operation is time-bounded by constants in db.py: DB_COMMAND_TIMEOUT_SECONDS (5), DB_ACQUIRE_TIMEOUT_SECONDS (5), DB_STARTUP_TIMEOUT_SECONDS (30; startup fails loudly with 'startup failed: ... timed out'), HEALTH_DB_TIMEOUT_SECONDS (2); a timeout in a request path is a 503, in a writer a failed write." Also: test doubles' acquire() must accept timeout=; remove any "/health is plain liveness" statement.
+  </claude_md_text>
+  <blocked_reason>none</blocked_reason>
+  <self_critique>Real-PG lock test proves command_timeout surfaces as 503 for rules/alerts; acquire timeout against real asyncpg is only covered with stubs. Startup timeout covered with fakes only, not a real hung Postgres.</self_critique>
+</implementation>

@@ -1,0 +1,42 @@
+<implementation>
+  <iteration>1</iteration>
+  <files>
+    <file path="backend/app/db.py">_alert_writer rewritten (whole iteration under try/except Exception + log.exception, per-alert row building, task_done in finally per dequeued alert, failed = row_failures > 0 in new _write_alert_rows, drop comment); rate-limited queue-full warning (ALERT_DROP_WARN_INTERVAL_SECONDS=10.0, drop counter, monotonic clock via import time); _backfill_watchlist no longer swallows errors.</file>
+    <file path="backend/app/main.py">Services.startup split into _load_state: fail-loud when rules_persistence_enabled and db unavailable / rules or watchlist load raises; db.close() awaited and upstream never started on failure; flag false = opt-out (skip loads).</file>
+    <file path="backend/app/rules.py">RuleStore.load propagates repo errors (docstring updated).</file>
+    <file path="backend/tests/fakes/fake_db.py">Added load_rules_error, load_watchlist_error, close_calls.</file>
+    <file path="backend/tests/conftest.py">client_no_db now uses Settings(rules_persistence_enabled=False) with the real Database.</file>
+    <file path="backend/tests/test_watchlist_alerts.py">New: 2 writer-survives-bad-alert tests, rate-limited warning test, 3 fail-loud startup tests, opt-out test; replaced test_startup_db_down_empty_watchlist_health_ok.</file>
+    <file path="backend/tests/test_rules_postgres.py">New: unreachable URL fails startup; backfill failure (pre-existing watchlist without created_at) leaves available False, no alert worker, startup raises.</file>
+    <file path="backend/tests/test_rules_engine.py">Renamed swallows test to propagates, asserts RuntimeError raises; added import pytest.</file>
+    <file path="backend/tests/test_api_symbols.py">test_single_upstream_started_and_stopped_once uses fake_db.</file>
+    <file path="docker-compose.yml">postgres pg_isready healthcheck; backend depends_on postgres condition service_healthy. Nothing else.</file>
+    <file path="CLAUDE.md">Fail-loud/opt-out/flag semantics and healthcheck described; Alert writer paragraph updated; known issues 4 and 6 removed, 5 reworded as accepted limitation (now item 4), renumbered; invariant 5 reworded; failed-flag nit removed. revised-planning.md untouched.</file>
+  </files>
+  <tests>
+    <test>FAIL-BEFORE (current db.py, tests written first): test_writer_survives_bad_alert_in_same_batch and test_writer_survives_bad_alert_in_separate_batches both FAILED with asyncio TimeoutError from wait_for(queue.join(), 1) (writer task died with AttributeError, join hangs). Run: 2 failed, 43 deselected.</test>
+    <test>PASS-AFTER: both pass; whole test_watchlist_alerts.py 45 passed right after the db.py change.</test>
+    <test>Offline full suite: 82 passed, 17 skipped (real-Postgres tests skipped), 0 failed.</test>
+    <test>Real Postgres 17 (throwaway cluster, port 55490): 99 passed, 0 skipped, 0 failed.</test>
+    <test>docker compose config NOT run: docker is not installed here (command not found). Compose YAML checked by reading; diff is +8/-1 lines.</test>
+  </tests>
+  <commands_run>
+    <command>python -X faulthandler -m pytest -o faulthandler_timeout=120 (offline, and with TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55490/t009)</command>
+    <command>PG17 initdb -A trust in %TEMP%/t009pg_169, pg_ctl start -p 55490, createdb t009, pg_ctl stop, rm -rf of the temp dir</command>
+  </commands_run>
+  <design_decisions>
+    <decision>Extracted _write_alert_rows helper from _alert_writer to keep nesting readable; rejected keeping everything inline in one 50-line function.</decision>
+    <decision>Unexpected writer error sets failed=True so the loop backs off ALERT_FAILURE_BACKOFF_SECONDS; rejected immediate retry (could spin on a persistent fault).</decision>
+    <decision>Real-DB backfill failure forced by pre-creating a watchlist table without created_at (no monkeypatching); rejected patching asyncpg.</decision>
+    <decision>Rate-limit uses time.monotonic accessed as app.db.time.monotonic so the test patches only that; first drop warns immediately.</decision>
+    <decision>Opt-out (flag false) skips loads and availability check; Database.connect still runs (so workers start if a URL is given). Empty DATABASE_URL with flag true fails (user decision B).</decision>
+    <decision>Known-issue numbers renumbered after deletions (issue 5 became 4, 7 became 5, 8 became 6); heading changed from "not fixed" to "(from T008 review)".</decision>
+  </design_decisions>
+  <deviations>
+    The test_rules_engine assertion for the renamed test uses pytest.raises(RuntimeError) (not a specific custom error). The first background combined shell command hung on pg_ctl; the orphaned pytest (PID 15464) from it was killed; the throwaway postmaster (PID 1020 tree) was stopped via pg_ctl and its dir deleted. Remaining postgres.exe/pg_ctl processes visible in the Services session (PIDs ~4696, 5944 ...) pre-existed and are not mine. The .env.example is unchanged.
+  </deviations>
+  <blocked_reason>none</blocked_reason>
+  <self_critique>
+    Least covered: cancellation mid-batch fill (task_done count) is covered only by existing close tests, not a new test. The CLAUDE.md known-issues renumbering may not match what the orchestrator expects. Docker config not validated.
+  </self_critique>
+</implementation>
