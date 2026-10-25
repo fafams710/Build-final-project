@@ -29,6 +29,7 @@ class MockWebSocket {
 
 describe("Dashboard", () => {
   beforeEach(() => {
+    sessionStorage.setItem("apiKey", "test-key");
     MockWebSocket.instances = [];
     vi.stubGlobal("WebSocket", MockWebSocket);
     vi.stubGlobal(
@@ -38,6 +39,7 @@ describe("Dashboard", () => {
   });
   afterEach(() => {
     cleanup();
+    sessionStorage.clear();
     vi.unstubAllGlobals();
   });
 

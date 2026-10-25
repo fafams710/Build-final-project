@@ -6,6 +6,9 @@ from app.main import create_app
 from tests.fakes.fake_db import FakeDatabase
 from tests.fakes.fake_finnhub import FakeFinnhubClient
 
+TEST_KEY = "test-key"
+AUTH = {"X-API-Key": TEST_KEY}
+
 
 @pytest.fixture
 def settings() -> Settings:
@@ -14,6 +17,7 @@ def settings() -> Settings:
         _env_file=None,
         finnhub_api_key="",
         database_url="",
+        app_api_key=TEST_KEY,
     )
 
 
@@ -26,7 +30,7 @@ def fake_db() -> FakeDatabase:
 def client(settings, fake_db):
     FakeFinnhubClient.instances.clear()
     app = create_app(settings, upstream_factory=FakeFinnhubClient.factory, db=fake_db)
-    with TestClient(app) as c:
+    with TestClient(app, headers=AUTH) as c:
         yield c
 
 
@@ -40,7 +44,8 @@ def client_no_db():
         finnhub_api_key="",
         database_url="",
         rules_persistence_enabled=False,
+        app_api_key=TEST_KEY,
     )
     app = create_app(opt_out, upstream_factory=FakeFinnhubClient.factory)
-    with TestClient(app) as c:
+    with TestClient(app, headers=AUTH) as c:
         yield c

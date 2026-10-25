@@ -4,7 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Optional
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import Settings, get_settings
@@ -14,6 +14,7 @@ from .finnhub_client import FinnhubClient
 from .models import Alert, Tick, normalize_symbol
 from .routers import alerts as alerts_router, health, rules as rules_router, symbols, ws
 from .rules import RuleEngine, RuleStore
+from .security import install_key_mask, require_api_key
 from .subscription_manager import SubscriptionManager
 
 log = logging.getLogger(__name__)
@@ -227,10 +228,20 @@ def create_app(
 ) -> FastAPI:
     _configure_logging()
     settings = settings or get_settings()
+    install_key_mask(settings.app_api_key)
     factory = upstream_factory or default_upstream_factory
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # First: auth is required regardless of RULES_PERSISTENCE_ENABLED, and
+        # nothing (db, workers, upstream) may start without it.
+        if not settings.app_api_key.strip():
+            log.error(
+                "startup failed: APP_API_KEY is not set; generate one with "
+                "python -c \"import secrets; print(secrets.token_urlsafe(32))\" "
+                "and put it in .env"
+            )
+            raise RuntimeError("APP_API_KEY is not set")
         services = Services(settings, db=db)
         app.state.services = services
         await services.startup(factory)
@@ -247,9 +258,10 @@ def create_app(
         allow_headers=["*"],
     )
     app.include_router(health.router)
-    app.include_router(symbols.router)
-    app.include_router(rules_router.router)
-    app.include_router(alerts_router.router)
+    auth = [Depends(require_api_key)]
+    app.include_router(symbols.router, dependencies=auth)
+    app.include_router(rules_router.router, dependencies=auth)
+    app.include_router(alerts_router.router, dependencies=auth)
     app.include_router(ws.router)
     return app
 

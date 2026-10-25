@@ -15,6 +15,7 @@ from app.config import Settings
 from app.db import Database, DatabaseUnavailable, WatchlistFull
 from app.main import create_app
 from app.models import Alert, Rule, Tick
+from tests.conftest import AUTH, TEST_KEY
 from tests.fakes.fake_finnhub import FakeFinnhubClient
 
 URL = os.environ.get("TEST_DATABASE_URL", "")
@@ -128,13 +129,13 @@ async def test_connect_drops_webhook_url_and_keeps_rows():
 
 def _app():
     FakeFinnhubClient.instances.clear()
-    settings = Settings(_env_file=None, finnhub_api_key="", database_url=URL)
+    settings = Settings(_env_file=None, finnhub_api_key="", app_api_key=TEST_KEY, database_url=URL)
     return create_app(settings, upstream_factory=FakeFinnhubClient.factory)
 
 
 def test_api_round_trip():
     body = {"symbol": "aapl", "type": "price_above", "threshold": 100}
-    with TestClient(_app()) as c:
+    with TestClient(_app(), headers=AUTH) as c:
         r = c.post("/api/rules", json=body)
         assert r.status_code == 201
         rid = r.json()["id"]
@@ -146,9 +147,9 @@ def test_api_round_trip():
 
 def test_restart_reloads_rules_and_engine_fires():
     body = {"symbol": "AAPL", "type": "price_above", "threshold": 100}
-    with TestClient(_app()) as c:
+    with TestClient(_app(), headers=AUTH) as c:
         rid = c.post("/api/rules", json=body).json()["id"]
-    with TestClient(_app()) as c:
+    with TestClient(_app(), headers=AUTH) as c:
         assert [x["id"] for x in c.get("/api/rules").json()] == [rid]
         services = c.app.state.services
         assert rid in services.rule_store
@@ -246,7 +247,7 @@ async def test_alert_worker_persists_and_survives_failure(db):
 
 async def test_alerts_survive_rule_deletion_via_api():
     body = {"symbol": "AAPL", "type": "price_above", "threshold": 100}
-    with TestClient(_app()) as c:
+    with TestClient(_app(), headers=AUTH) as c:
         rid = c.post("/api/rules", json=body).json()["id"]
         db = c.app.state.services.db
         db.enqueue_alert(_alert("a1", 10.0, rule_id=rid))
@@ -262,10 +263,10 @@ async def test_alerts_survive_rule_deletion_via_api():
 
 def test_restart_reloads_watchlist_and_subscribes():
     body = {"symbol": "aapl", "type": "price_above", "threshold": 100}
-    with TestClient(_app()) as c:
+    with TestClient(_app(), headers=AUTH) as c:
         assert c.post("/api/rules", json=body).status_code == 201
         assert FakeFinnhubClient.instances[0].subscribed == ["AAPL"]
-    with TestClient(_app()) as c:
+    with TestClient(_app(), headers=AUTH) as c:
         up = FakeFinnhubClient.instances[0]
         assert c.app.state.services.watchlist == {"AAPL"}
         assert "AAPL" in up.get_symbols()
@@ -296,10 +297,10 @@ async def test_preexisting_rule_backfilled_into_watchlist():
 
 def test_api_cap_409_with_real_db():
     FakeFinnhubClient.instances.clear()
-    settings = Settings(_env_file=None, finnhub_api_key="", database_url=URL,
+    settings = Settings(_env_file=None, finnhub_api_key="", app_api_key=TEST_KEY, database_url=URL,
                         watchlist_max_symbols=1)
     app = create_app(settings, upstream_factory=FakeFinnhubClient.factory)
-    with TestClient(app) as c:
+    with TestClient(app, headers=AUTH) as c:
         assert c.post("/api/rules", json={"symbol": "A", "type": "price_above", "threshold": 1}).status_code == 201
         assert c.post("/api/rules", json={"symbol": "B", "type": "price_above", "threshold": 1}).status_code == 409
         assert [r["symbol"] for r in c.get("/api/rules").json()] == ["A"]
@@ -308,11 +309,11 @@ def test_api_cap_409_with_real_db():
 # ---- T009: fail-loud startup ---------------------------------------------
 def test_startup_fails_loudly_when_postgres_unreachable():
     FakeFinnhubClient.instances.clear()
-    settings = Settings(_env_file=None, finnhub_api_key="",
+    settings = Settings(_env_file=None, finnhub_api_key="", app_api_key=TEST_KEY,
                         database_url="postgresql://u:p@127.0.0.1:1/none")
     app = create_app(settings, upstream_factory=FakeFinnhubClient.factory)
     with pytest.raises(RuntimeError):
-        with TestClient(app):
+        with TestClient(app, headers=AUTH):
             pass
     assert all(not i.start_calls for i in FakeFinnhubClient.instances)
 
@@ -334,7 +335,7 @@ async def test_backfill_failure_leaves_database_unavailable_and_startup_fails():
     assert d._alert_worker is None
     await d.close()
     with pytest.raises(RuntimeError):
-        with TestClient(_app()):
+        with TestClient(_app(), headers=AUTH):
             pass
 
 
@@ -356,7 +357,7 @@ async def test_startup_skips_malformed_rule_and_watchlist_rows(caplog):
         "INSERT INTO watchlist VALUES ('bad symbol!', 2)",
     )
     with caplog.at_level(logging.WARNING, logger="app"):
-        with TestClient(_app()) as c:
+        with TestClient(_app(), headers=AUTH) as c:
             services = c.app.state.services
             assert "good" in services.rule_store
             for bad in ("badsym", "badtype", "badthr"):
@@ -375,7 +376,7 @@ async def test_startup_skips_malformed_rule_and_watchlist_rows(caplog):
 async def test_get_rules_skips_malformed_row_with_warning(caplog):
     import logging
 
-    with TestClient(_app()) as c:
+    with TestClient(_app(), headers=AUTH) as c:
         rid = c.post(
             "/api/rules", json={"symbol": "AAPL", "type": "price_above", "threshold": 100}
         ).json()["id"]

@@ -10,10 +10,12 @@ from app.config import Settings
 from app.db import ALERT_DROP_WARN_INTERVAL_SECONDS, Database
 from app.main import Services, create_app
 from app.models import Alert, Rule, Tick
+from tests.conftest import AUTH, TEST_KEY
 from tests.fakes.fake_db import FakeDatabase
 from tests.fakes.fake_finnhub import FakeFinnhubClient
 
 RULE = {"symbol": "AAPL", "type": "price_above", "threshold": 100}
+WS = f"/ws?key={TEST_KEY}"
 
 
 def _rule(symbol="AAPL"):
@@ -32,9 +34,10 @@ def _services(watchlist=()):
 @pytest.fixture
 def small_client(fake_db):
     FakeFinnhubClient.instances.clear()
-    settings = Settings(_env_file=None, finnhub_api_key="", database_url="", watchlist_max_symbols=2)
+    settings = Settings(_env_file=None, finnhub_api_key="", database_url="", watchlist_max_symbols=2,
+                        app_api_key=TEST_KEY)
     app = create_app(settings, upstream_factory=FakeFinnhubClient.factory, db=fake_db)
-    with TestClient(app) as c:
+    with TestClient(app, headers=AUTH) as c:
         yield c
 
 
@@ -93,7 +96,7 @@ def test_upstream_subscribe_failure_still_201(client, caplog):
 
 def test_browser_holding_symbol_means_rule_sends_no_subscribe(client):
     up = FakeFinnhubClient.instances[0]
-    with client.websocket_connect("/ws") as ws:
+    with client.websocket_connect(WS) as ws:
         ws.send_json({"action": "subscribe", "symbol": "aapl"})
         assert ws.receive_json()["type"] == "subscribed"
         assert up.subscribed == ["AAPL"]
@@ -104,7 +107,7 @@ def test_browser_holding_symbol_means_rule_sends_no_subscribe(client):
 
 def test_no_upstream_rule_creation_works(settings, fake_db):
     app = create_app(settings, upstream_factory=lambda *a: None, db=fake_db)
-    with TestClient(app) as c:
+    with TestClient(app, headers=AUTH) as c:
         assert c.post("/api/rules", json=RULE).status_code == 201
 
 
@@ -187,12 +190,12 @@ async def test_get_symbols_is_sorted_union_and_connect_subscribes_each_once():
 def test_factory_receives_union_callable(fake_db):
     fake_db.watchlist = {"A", "B"}
     FakeFinnhubClient.instances.clear()
-    settings = Settings(_env_file=None, finnhub_api_key="", database_url="")
+    settings = Settings(_env_file=None, finnhub_api_key="", database_url="", app_api_key=TEST_KEY)
     app = create_app(settings, upstream_factory=FakeFinnhubClient.factory, db=fake_db)
-    with TestClient(app) as c:
+    with TestClient(app, headers=AUTH) as c:
         up = FakeFinnhubClient.instances[0]
         assert up.get_symbols() == ["A", "B"]
-        with c.websocket_connect("/ws") as ws:
+        with c.websocket_connect(WS) as ws:
             ws.send_json({"action": "subscribe", "symbol": "b"})
             ws.receive_json()
             ws.send_json({"action": "subscribe", "symbol": "c"})
@@ -205,7 +208,7 @@ def _failing_start(settings, db, caplog):
     app = create_app(settings, upstream_factory=FakeFinnhubClient.factory, db=db)
     with caplog.at_level(logging.ERROR, logger="app"):
         with pytest.raises(Exception):
-            with TestClient(app):
+            with TestClient(app, headers=AUTH):
                 pass
     assert [r for r in caplog.records if r.levelno >= logging.ERROR and "startup failed" in r.getMessage()]
     assert all(not i.start_calls for i in FakeFinnhubClient.instances)
@@ -231,9 +234,9 @@ def test_startup_watchlist_load_failure_fails_loudly(settings, caplog):
 def test_startup_opt_out_starts_empty_and_503():
     FakeFinnhubClient.instances.clear()
     opt_out = Settings(_env_file=None, finnhub_api_key="", database_url="",
-                       rules_persistence_enabled=False)
+                       rules_persistence_enabled=False, app_api_key=TEST_KEY)
     app = create_app(opt_out, upstream_factory=FakeFinnhubClient.factory)
-    with TestClient(app) as c:
+    with TestClient(app, headers=AUTH) as c:
         assert c.get("/health").status_code == 200
         assert c.app.state.services.watchlist == set()
         assert c.get("/api/rules").status_code == 503
@@ -274,7 +277,7 @@ def test_multiple_rules_one_alert_each(client, fake_db):
 def test_enqueue_failure_does_not_stop_broadcast(client, fake_db):
     client.post("/api/rules", json=RULE)
     fake_db.enqueue_error = RuntimeError("boom")
-    with client.websocket_connect("/ws") as ws:
+    with client.websocket_connect(WS) as ws:
         ws.send_json({"action": "subscribe", "symbol": "AAPL"})
         assert ws.receive_json()["type"] == "subscribed"
         _tick(client, 101)
@@ -800,7 +803,7 @@ def test_startup_skips_bad_rule_row_and_bad_watchlist_symbol(settings, caplog):
     )
     app = create_app(settings, upstream_factory=FakeFinnhubClient.factory, db=db)
     with caplog.at_level(logging.WARNING, logger="app"):
-        with TestClient(app) as c:
+        with TestClient(app, headers=AUTH) as c:
             services = c.app.state.services
             assert "good" in services.rule_store
             assert "bad" not in services.rule_store
@@ -815,7 +818,7 @@ def test_startup_skips_bad_watchlist_symbol_with_fake_db(settings, fake_db, capl
     fake_db.watchlist = {"AAPL", "bad symbol!"}
     app = create_app(settings, upstream_factory=FakeFinnhubClient.factory, db=fake_db)
     with caplog.at_level(logging.WARNING, logger="app"):
-        with TestClient(app) as c:
+        with TestClient(app, headers=AUTH) as c:
             assert c.app.state.services.watchlist == {"AAPL"}
     assert "bad symbol!" in caplog.text
 
