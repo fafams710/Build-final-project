@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import { wsUrl } from "../api/client";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { getApiKey, onUnauthorized, setApiKey, wsUrl } from "../api/client";
 import { useWebSocket } from "../hooks/useWebSocket";
 import AlertList from "./AlertList";
 import PriceTicker from "./PriceTicker";
@@ -7,7 +7,27 @@ import RuleForm from "./RuleForm";
 import RuleList from "./RuleList";
 import SymbolSubscribe from "./SymbolSubscribe";
 
-export default function Dashboard() {
+function KeyPrompt({ onSaved }: { onSaved: () => void }) {
+  const [value, setValue] = useState("");
+  const save = (e: FormEvent) => {
+    e.preventDefault();
+    const key = value.trim();
+    if (!key) return;
+    setApiKey(key);
+    onSaved();
+  };
+  return (
+    <form onSubmit={save}>
+      <label>
+        API key
+        <input type="password" value={value} onChange={(e) => setValue(e.target.value)} />
+      </label>
+      <button type="submit">Save</button>
+    </form>
+  );
+}
+
+function DashboardContent() {
   const [symbols, setSymbols] = useState<string[]>([]);
   const [prices, setPrices] = useState<Record<string, number>>({});
   const [rulesVersion, setRulesVersion] = useState(0);
@@ -55,4 +75,11 @@ export default function Dashboard() {
       <AlertList />
     </div>
   );
+}
+
+export default function Dashboard() {
+  const [hasKey, setHasKey] = useState(() => getApiKey() !== null);
+  useEffect(() => onUnauthorized(() => setHasKey(false)), []);
+  if (!hasKey) return <KeyPrompt onSaved={() => setHasKey(true)} />;
+  return <DashboardContent />;
 }

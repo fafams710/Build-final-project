@@ -5,6 +5,7 @@ import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from ..models import normalize_symbol
+from ..security import key_matches
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -13,6 +14,14 @@ router = APIRouter()
 @router.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket) -> None:
     svc = websocket.app.state.services
+    # Gate before accept(): the handshake is answered with HTTP 403 and nothing
+    # is registered. Same outcome for every failure reason.
+    origin = websocket.headers.get("origin")
+    if (origin is not None and origin not in svc.settings.cors_origin_list) or not key_matches(
+        websocket.query_params.get("key"), svc.settings.app_api_key
+    ):
+        await websocket.close(code=1008)
+        return
     conn_id = await svc.connections.connect(websocket)
 
     async def reply(message: dict) -> None:

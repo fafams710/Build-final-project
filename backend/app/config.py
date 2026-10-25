@@ -8,6 +8,9 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     finnhub_api_key: str = ""
+    # Shared secret for /api/* (X-API-Key header) and /ws (?key=). Required at
+    # startup. Generate: python -c "import secrets; print(secrets.token_urlsafe(32))"
+    app_api_key: str = ""
     finnhub_ws_url: str = "wss://ws.finnhub.io"
     database_url: str = ""
     cors_origins: str = "http://localhost:5173"

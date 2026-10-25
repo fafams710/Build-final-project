@@ -1,4 +1,7 @@
+from tests.conftest import AUTH, TEST_KEY
 from tests.fakes.fake_finnhub import FakeFinnhubClient
+
+WS = f"/ws?key={TEST_KEY}"
 
 
 def tick_msg(ws):
@@ -15,8 +18,8 @@ def test_single_upstream_started_and_stopped_once(settings, fake_db):
 
     FakeFinnhubClient.instances.clear()
     app = create_app(settings, upstream_factory=FakeFinnhubClient.factory, db=fake_db)
-    with TestClient(app) as c:
-        with c.websocket_connect("/ws") as a, c.websocket_connect("/ws") as b:
+    with TestClient(app, headers=AUTH) as c:
+        with c.websocket_connect(WS) as a, c.websocket_connect(WS) as b:
             for ws in (a, b):
                 for sym in ("AAPL", "MSFT"):
                     ws.send_json({"action": "subscribe", "symbol": sym})
@@ -30,7 +33,7 @@ def test_single_upstream_started_and_stopped_once(settings, fake_db):
 
 def test_subscribe_dedupes_upstream_and_fans_out_per_symbol(client):
     up = FakeFinnhubClient.instances[0]
-    with client.websocket_connect("/ws") as a, client.websocket_connect("/ws") as b:
+    with client.websocket_connect(WS) as a, client.websocket_connect(WS) as b:
         a.send_json({"action": "subscribe", "symbol": "aapl"})
         assert a.receive_json() == {"type": "subscribed", "symbol": "AAPL"}
         b.send_json({"action": "subscribe", "symbol": "AAPL"})
@@ -64,7 +67,7 @@ def test_subscribe_dedupes_upstream_and_fans_out_per_symbol(client):
 
 
 def test_subscribe_without_snapshot_and_error_replies(client):
-    with client.websocket_connect("/ws") as ws:
+    with client.websocket_connect(WS) as ws:
         ws.send_json({"action": "subscribe", "symbol": "NEW"})
         assert ws.receive_json() == {"type": "subscribed", "symbol": "NEW"}
         ws.send_json({"action": "bogus", "symbol": "NEW"})
@@ -81,7 +84,7 @@ def test_rule_fires_one_info_log_and_tick_still_broadcast(client, caplog):
     up = FakeFinnhubClient.instances[0]
     r = client.post("/api/rules", json={"symbol": "AAPL", "type": "price_above", "threshold": 100})
     assert r.status_code == 201
-    with client.websocket_connect("/ws") as ws:
+    with client.websocket_connect(WS) as ws:
         ws.send_json({"action": "subscribe", "symbol": "AAPL"})
         assert ws.receive_json()["type"] == "subscribed"
         with caplog.at_level(logging.INFO, logger="app.main"):
