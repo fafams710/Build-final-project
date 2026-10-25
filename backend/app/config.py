@@ -1,11 +1,15 @@
 """Application settings. All values come from environment variables or .env."""
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Repo-root .env (backend/app/config.py -> parents[2]), found whatever the working directory is.
+ROOT_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=(ROOT_ENV_FILE, ".env"), extra="ignore")
 
     finnhub_api_key: str = ""
     # Shared secret for /api/* (X-API-Key header) and /ws (?key=). Required at

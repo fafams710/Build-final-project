@@ -4,11 +4,12 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Optional
 
-from fastapi import Depends, FastAPI
+from fastapi import APIRouter, Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import Settings, get_settings
 from .connection_manager import ConnectionManager
+from . import db as db_module
 from .db import Database
 from .finnhub_client import FinnhubClient
 from .models import Alert, Tick, normalize_symbol
@@ -187,10 +188,32 @@ class Services:
         RULES_PERSISTENCE_ENABLED=true Postgres is required and any failure
         raises; with false it is the explicit opt-out (start empty, rule and
         alert endpoints answer 503)."""
+        limit = db_module.DB_STARTUP_TIMEOUT_SECONDS
+        try:
+            await asyncio.wait_for(self._load_state_unbounded(), timeout=limit)
+        except asyncio.TimeoutError:
+            # Fixed text on purpose: no exception message, URL or credential.
+            log.error(
+                "startup failed: Postgres setup timed out (startup limit %gs); "
+                "set RULES_PERSISTENCE_ENABLED=false to run without it",
+                limit,
+            )
+            raise RuntimeError("Postgres setup timed out at startup")
+
+    async def _load_state_unbounded(self) -> None:
         await self.db.connect()
         if not self.settings.rules_persistence_enabled:
             return
         if not self.db.available:
+            if getattr(self.db, "last_error_timed_out", False):
+                # Fixed text: no exception message, URL or credential.
+                log.error(
+                    "startup failed: Postgres setup timed out "
+                    "(query/connect limit %gs); "
+                    "set RULES_PERSISTENCE_ENABLED=false to run without it",
+                    db_module.DB_COMMAND_TIMEOUT_SECONDS,
+                )
+                raise RuntimeError("Postgres setup timed out at startup")
             log.error(
                 "startup failed: Postgres unavailable: %s; "
                 "set RULES_PERSISTENCE_ENABLED=false to run without it",
@@ -200,6 +223,14 @@ class Services:
         try:
             await self.rule_store.load()
             stored = await self.db.load_watchlist()
+        except asyncio.TimeoutError:
+            log.error(
+                "startup failed: Postgres setup timed out "
+                "(query/connect limit %gs); "
+                "set RULES_PERSISTENCE_ENABLED=false to run without it",
+                db_module.DB_COMMAND_TIMEOUT_SECONDS,
+            )
+            raise RuntimeError("Postgres setup timed out at startup")
         except Exception as exc:
             log.error(
                 "startup failed: loading rules/watchlist: %s: %s; "
@@ -258,10 +289,15 @@ def create_app(
         allow_headers=["*"],
     )
     app.include_router(health.router)
-    auth = [Depends(require_api_key)]
-    app.include_router(symbols.router, dependencies=auth)
-    app.include_router(rules_router.router, dependencies=auth)
-    app.include_router(alerts_router.router, dependencies=auth)
+    # Single parent for every /api router: it carries the key check. Add each
+    # future /api router HERE, never on `app` (tests/test_api_auth_coverage.py
+    # fails otherwise). /health and /ws are deliberately outside it. Built per
+    # create_app call so repeated calls do not accumulate routes.
+    api = APIRouter(dependencies=[Depends(require_api_key)])
+    api.include_router(symbols.router)
+    api.include_router(rules_router.router)
+    api.include_router(alerts_router.router)
+    app.include_router(api)
     app.include_router(ws.router)
     return app
 

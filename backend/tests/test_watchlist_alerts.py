@@ -473,7 +473,7 @@ class StubPool:
         self.closed_after_rows: int | None = None
         self.mode = "ok"  # ok | fail | block
 
-    def acquire(self):
+    def acquire(self, timeout=None):
         return _Acquire(self)
 
     async def on_executemany(self, rows):
@@ -756,7 +756,7 @@ class _StubPool:
     def __init__(self, rules, symbols):
         self._conn = _StubConn(rules, symbols)
 
-    def acquire(self):
+    def acquire(self, timeout=None):
         conn = self._conn
 
         class _Ctx:

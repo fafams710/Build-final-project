@@ -389,3 +389,104 @@ async def test_get_rules_skips_malformed_row_with_warning(caplog):
         assert r.status_code == 200
         assert [x["id"] for x in r.json()] == [rid]
     assert "badsym" in caplog.text and "badtype" in caplog.text
+
+
+# ---- T012: database timeouts and honest /health ---------------------------
+def _timed(fn, *a, **kw):
+    t0 = time.monotonic()
+    r = fn(*a, **kw)
+    return r, time.monotonic() - t0
+
+
+async def test_locked_tables_give_503_not_a_hang(monkeypatch):
+    # Patched BEFORE connect() so the pool is created with the small limit.
+    monkeypatch.setattr("app.db.DB_COMMAND_TIMEOUT_SECONDS", 0.5)
+    body = {"symbol": "AAPL", "type": "price_above", "threshold": 100}
+    holder = None
+    tx = None
+    with TestClient(_app(), headers=AUTH) as c:
+        rid = c.post("/api/rules", json=body).json()["id"]
+
+        async def lock(table):
+            nonlocal holder, tx
+            holder = await asyncpg.connect(URL)
+            tx = holder.transaction()
+            await tx.start()
+            await holder.execute(f"LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE")
+
+        async def unlock():
+            nonlocal holder, tx
+            try:
+                if tx is not None:
+                    await tx.rollback()
+            finally:
+                if holder is not None:
+                    await holder.close()
+                holder = tx = None
+
+        try:
+            await lock("alert_rules")
+            for call in (
+                lambda: c.get("/api/rules"),
+                lambda: c.post("/api/rules", json=body),
+                lambda: c.delete(f"/api/rules/{rid}"),
+            ):
+                r, elapsed = _timed(call)
+                assert r.status_code == 503 and elapsed < 3, (r.status_code, elapsed)
+            await unlock()
+            assert c.get("/api/rules").status_code == 200
+            assert c.post("/api/rules", json=body).status_code == 201
+            await lock("alerts")
+            r, elapsed = _timed(lambda: c.get("/api/alerts"))
+            assert r.status_code == 503 and elapsed < 3
+            await unlock()
+            assert c.get("/api/alerts").status_code == 200
+            assert c.delete(f"/api/rules/{rid}").status_code == 204
+        finally:
+            await unlock()
+
+
+def test_health_real_postgres_ok_then_down_when_pool_closed():
+    with TestClient(_app()) as c:
+        r = c.get("/health")
+        assert r.status_code == 200 and r.json()["database"] == "ok"
+        c.portal.call(c.app.state.services.db._close_pool)
+        r = c.get("/health")
+        assert r.status_code == 503
+        assert r.json()["database"] == "down" and r.json()["status"] == "degraded"
+
+
+async def test_startup_against_locked_table_fails_with_timed_out_line(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr("app.db.DB_COMMAND_TIMEOUT_SECONDS", 0.5)
+    seed = Database(URL, persist_ticks=False)
+    await seed.connect()  # create the tables so there is something to lock
+    await seed.close()
+    holder = await asyncpg.connect(URL)
+    tx = holder.transaction()
+    await tx.start()
+    try:
+        await holder.execute("LOCK TABLE alert_rules IN ACCESS EXCLUSIVE MODE")
+        app = _app()
+
+        async def run():
+            async with app.router.lifespan_context(app):
+                pass
+
+        t0 = time.monotonic()
+        with caplog.at_level(logging.ERROR, logger="app"):
+            with pytest.raises(Exception):
+                await asyncio.wait_for(run(), 20)
+        assert time.monotonic() - t0 < 15
+    finally:
+        await tx.rollback()
+        await holder.close()
+    lines = [
+        r.getMessage() for r in caplog.records
+        if r.getMessage().startswith("startup failed:")
+    ]
+    assert len(lines) == 1, lines
+    assert "timed out" in lines[0] and "query/connect limit 0.5s" in lines[0]
+    assert "RULES_PERSISTENCE_ENABLED=false" in lines[0]
+    assert URL not in caplog.text

@@ -1,4 +1,5 @@
 """In-memory stand-in for app.db.Database (rule methods only)."""
+import asyncio
 from typing import Optional
 
 from app.db import DatabaseUnavailable, WatchlistFull
@@ -16,6 +17,9 @@ class FakeDatabase:
         self.load_watchlist_error: Optional[Exception] = None
         self.close_calls = 0
         self.last_error: Optional[str] = None
+        self.ping_calls = 0
+        self.ping_error: Optional[Exception] = None
+        self.ping_hang = False
 
     @property
     def available(self) -> bool:
@@ -27,6 +31,14 @@ class FakeDatabase:
 
     async def connect(self) -> None:
         return None
+
+    async def ping(self) -> bool:
+        self.ping_calls += 1
+        if self.ping_error is not None:
+            raise self.ping_error
+        if self.ping_hang:
+            await asyncio.Event().wait()
+        return not self.failing
 
     async def close(self) -> None:
         self.close_calls += 1

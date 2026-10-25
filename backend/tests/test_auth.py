@@ -116,7 +116,8 @@ def test_no_state_change_without_key(raw, fake_db):
 
 def test_health_open(raw):
     r = raw.get("/health")
-    assert r.status_code == 200 and r.json() == {"status": "ok"}
+    assert r.status_code == 200
+    assert r.json() == {"status": "degraded", "database": "ok", "upstream": "disconnected"}
 
 
 def test_preflight_without_key(raw):

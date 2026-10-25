@@ -53,6 +53,15 @@ ALERT_FAILURE_BACKOFF_SECONDS = 1.0
 # At most one "alert queue full" warning per this many seconds (with a drop count).
 ALERT_DROP_WARN_INTERVAL_SECONDS = 10.0
 
+# Per-query limit (asyncpg command_timeout) on every pooled connection.
+DB_COMMAND_TIMEOUT_SECONDS = 5.0
+# Longest wait to get a connection from the pool (timeout= on every acquire).
+DB_ACQUIRE_TIMEOUT_SECONDS = 5.0
+# One overall limit for startup: connect, schema, backfill, loading rules and watchlist.
+DB_STARTUP_TIMEOUT_SECONDS = 30.0
+# Limit for the /health SELECT 1 probe (acquire and query together).
+HEALTH_DB_TIMEOUT_SECONDS = 2.0
+
 # Serialises watchlist cap checks across concurrent rule creations.
 _WATCHLIST_LOCK_KEY = 8_008_001
 
@@ -90,6 +99,8 @@ class Database:
         self._last_drop_warning: Optional[float] = None
         # "<ExceptionType>: <message>" of the last failed connect(), else None.
         self.last_error: Optional[str] = None
+        # True when the last failed connect() was a timeout (query, acquire or connect).
+        self.last_error_timed_out = False
 
     def _describe_error(self, exc: BaseException) -> str:
         """Type and message, with the URL and its credentials scrubbed out. The bare
@@ -111,8 +122,27 @@ class Database:
     def available(self) -> bool:
         return self._pool is not None
 
+    async def ping(self) -> bool:
+        """Health probe: SELECT 1 within HEALTH_DB_TIMEOUT_SECONDS. Never raises."""
+        pool = self._pool
+        if pool is None:
+            return False
+        try:
+            async def probe() -> None:
+                async with pool.acquire(timeout=HEALTH_DB_TIMEOUT_SECONDS) as conn:
+                    await conn.fetchval("SELECT 1", timeout=HEALTH_DB_TIMEOUT_SECONDS)
+
+            await asyncio.wait_for(probe(), timeout=HEALTH_DB_TIMEOUT_SECONDS)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("database ping failed: %s", type(exc).__name__)
+            return False
+
     async def connect(self) -> None:
         self.last_error = None
+        self.last_error_timed_out = False
         if not self._url:
             self.last_error = "DATABASE_URL is empty"
             return
@@ -120,9 +150,13 @@ class Database:
             import asyncpg
 
             self._pool = await asyncio.wait_for(
-                asyncpg.create_pool(self._url, min_size=1, max_size=4, timeout=5), timeout=10
+                asyncpg.create_pool(
+                    self._url, min_size=1, max_size=4, timeout=5,
+                    command_timeout=DB_COMMAND_TIMEOUT_SECONDS,
+                ),
+                timeout=10,
             )
-            async with self._pool.acquire() as conn:
+            async with self._pool.acquire(timeout=DB_ACQUIRE_TIMEOUT_SECONDS) as conn:
                 for stmt in SCHEMA:
                     await conn.execute(stmt)
             await self._backfill_watchlist()
@@ -132,6 +166,9 @@ class Database:
             if self._persist_ticks:
                 self._worker = asyncio.create_task(self._tick_worker(), name="tick-writer")
         except Exception as exc:
+            self.last_error_timed_out = isinstance(
+                exc, (asyncio.TimeoutError, TimeoutError)
+            ) or type(exc).__name__ == "QueryCanceledError"
             self.last_error = self._describe_error(exc)
             log.error("database connect/setup failed: %s", self.last_error)
             await self._close_pool()
@@ -189,7 +226,7 @@ class Database:
                 for t in batch
             ]
             try:
-                async with self._pool.acquire() as conn:
+                async with self._pool.acquire(timeout=DB_ACQUIRE_TIMEOUT_SECONDS) as conn:
                     await conn.executemany(
                         "INSERT INTO ticks (symbol, price, volume, exchange_ts, received_ts) "
                         "VALUES ($1, $2, $3, $4, $5)",
@@ -209,7 +246,7 @@ class Database:
 
     async def save_rule(self, rule: Rule) -> None:
         pool = self._require_rules_pool()
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=DB_ACQUIRE_TIMEOUT_SECONDS) as conn:
             await conn.execute(
                 "INSERT INTO alert_rules (id, symbol, type, threshold, window_seconds, "
                 "created_at) VALUES ($1,$2,$3,$4,$5,$6)",
@@ -219,13 +256,13 @@ class Database:
 
     async def delete_rule(self, rule_id: str) -> bool:
         pool = self._require_rules_pool()
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=DB_ACQUIRE_TIMEOUT_SECONDS) as conn:
             result = await conn.execute("DELETE FROM alert_rules WHERE id = $1", rule_id)
         return result.endswith(" 1")
 
     async def list_rules(self, symbol: Optional[str] = None, limit: int = 50) -> list[Rule]:
         pool = self._require_rules_pool()
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=DB_ACQUIRE_TIMEOUT_SECONDS) as conn:
             if symbol:
                 rows = await conn.fetch(
                     "SELECT * FROM alert_rules WHERE symbol = $1 "
@@ -257,7 +294,7 @@ class Database:
 
     async def load_rules(self) -> list[Rule]:
         pool = self._require_rules_pool()
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=DB_ACQUIRE_TIMEOUT_SECONDS) as conn:
             rows = await conn.fetch("SELECT * FROM alert_rules")
         return self._build_rules(rows)
 
@@ -268,7 +305,7 @@ class Database:
         WatchlistFull when the symbol is new and the cap is reached.
         """
         pool = self._require_rules_pool()
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=DB_ACQUIRE_TIMEOUT_SECONDS) as conn:
             async with conn.transaction():
                 await conn.execute("SELECT pg_advisory_xact_lock($1)", _WATCHLIST_LOCK_KEY)
                 exists = await conn.fetchval(
@@ -293,7 +330,7 @@ class Database:
 
     async def load_watchlist(self) -> list[str]:
         pool = self._require_rules_pool()
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=DB_ACQUIRE_TIMEOUT_SECONDS) as conn:
             rows = await conn.fetch("SELECT symbol FROM watchlist ORDER BY symbol")
         return [r["symbol"] for r in rows]
 
@@ -302,7 +339,7 @@ class Database:
         (cap not applied). Failures propagate to connect()."""
         if self._pool is None or not self._persist_rules:
             return
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire(timeout=DB_ACQUIRE_TIMEOUT_SECONDS) as conn:
             rows = await conn.fetch(
                 "SELECT symbol, MIN(created_at) AS created_at FROM alert_rules "
                 "GROUP BY symbol"
@@ -382,7 +419,7 @@ class Database:
     async def _write_alert_rows(self, sql: str, rows: list) -> bool:
         """Insert rows; returns True when some rows could not be written."""
         try:
-            async with self._pool.acquire() as conn:
+            async with self._pool.acquire(timeout=DB_ACQUIRE_TIMEOUT_SECONDS) as conn:
                 await conn.executemany(sql, rows)
             return False
         except asyncio.CancelledError:
@@ -394,7 +431,7 @@ class Database:
         last_exc: Optional[BaseException] = None
         for row in rows:
             try:
-                async with self._pool.acquire() as conn:
+                async with self._pool.acquire(timeout=DB_ACQUIRE_TIMEOUT_SECONDS) as conn:
                     await conn.execute(sql, *row)
             except asyncio.CancelledError:
                 raise
@@ -412,7 +449,7 @@ class Database:
 
     async def list_alerts(self, limit: int = 50) -> list[Alert]:
         pool = self._require_rules_pool()
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=DB_ACQUIRE_TIMEOUT_SECONDS) as conn:
             rows = await conn.fetch(
                 "SELECT id, rule_id, symbol, rule_type, threshold, price, triggered_at "
                 "FROM alerts ORDER BY triggered_at DESC, id DESC LIMIT $1",
