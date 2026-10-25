@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from typing import Any, Optional
+from typing import Any
 
 from .models import Rule, RuleCreate, RuleType, Tick
 
@@ -12,45 +12,34 @@ log = logging.getLogger(__name__)
 
 
 class RuleStore:
-    """Source of truth for evaluation. `repo` (optional) is best-effort persistence."""
+    """In-memory copy of the rules used for evaluation. Postgres is the source
+    of truth; `repo` is only used to load rules at startup."""
 
     def __init__(self, repo: Any = None) -> None:
         self._rules: dict[str, Rule] = {}
         self._repo = repo
 
     async def load(self) -> None:
+        """Load persisted rules; on any failure log and keep the store empty."""
         if self._repo is None:
             return
         try:
             for rule in await self._repo.load_rules():
                 self._rules[rule.id] = rule
-        except Exception:
-            log.exception("loading persisted rules failed")
+        except Exception as exc:
+            log.warning("loading persisted rules failed: %s", type(exc).__name__)
+
+    def put(self, rule: Rule) -> None:
+        self._rules[rule.id] = rule
+
+    def discard(self, rule_id: str) -> None:
+        self._rules.pop(rule_id, None)
 
     async def add(self, data: RuleCreate) -> Rule:
+        """In-memory only helper (no persistence)."""
         rule = Rule(**data.model_dump())
-        self._rules[rule.id] = rule
-        if self._repo is not None:
-            try:
-                await self._repo.save_rule(rule)
-            except Exception:
-                log.exception("persisting rule failed")
+        self.put(rule)
         return rule
-
-    async def remove(self, rule_id: str) -> bool:
-        existed = self._rules.pop(rule_id, None) is not None
-        if existed and self._repo is not None:
-            try:
-                await self._repo.delete_rule(rule_id)
-            except Exception:
-                log.exception("deleting persisted rule failed")
-        return existed
-
-    def list(self, symbol: Optional[str] = None) -> list[Rule]:
-        rules = list(self._rules.values())
-        if symbol:
-            rules = [r for r in rules if r.symbol == symbol]
-        return sorted(rules, key=lambda r: r.created_at)
 
     def for_symbol(self, symbol: str) -> list[Rule]:
         return [r for r in self._rules.values() if r.symbol == symbol]

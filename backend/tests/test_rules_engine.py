@@ -54,20 +54,25 @@ async def test_multiple_rules_fire_independently_and_other_symbols_ignored():
     assert len(eng.evaluate(tick(115))) == 1  # only the second newly fires
 
 
-async def test_store_crud_and_persistence_errors_are_swallowed():
+async def test_store_load_swallows_errors_and_does_not_persist():
+    calls = []
+
     class BrokenRepo:
         async def save_rule(self, r):
-            raise RuntimeError("db down")
+            calls.append("save")
 
         async def delete_rule(self, i):
-            raise RuntimeError("db down")
+            calls.append("delete")
 
         async def load_rules(self):
             raise RuntimeError("db down")
 
     store = RuleStore(repo=BrokenRepo())
-    await store.load()
+    await store.load()  # must not raise; store stays empty
+    assert store.for_symbol("AAPL") == []
     rule = await store.add(RuleCreate(symbol="aapl", type="price_above", threshold=1))
-    assert store.list() == [rule] and rule.symbol == "AAPL"
-    assert await store.remove(rule.id) is True
-    assert await store.remove(rule.id) is False
+    assert store.for_symbol("AAPL") == [rule] and rule.symbol == "AAPL"
+    store.discard(rule.id)
+    store.discard(rule.id)
+    assert rule.id not in store
+    assert calls == []

@@ -1,4 +1,5 @@
-"""Best-effort plain Postgres persistence for rules and ticks."""
+"""Plain Postgres persistence. Rules are the source of truth and their methods
+raise on failure; tick writes are queued and best-effort."""
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -24,7 +25,13 @@ SCHEMA = [
         window_seconds DOUBLE PRECISION,
         created_at DOUBLE PRECISION NOT NULL
     )""",
+    # Old volumes had a NOT NULL webhook_url column; drop it, keeping rows.
+    "ALTER TABLE alert_rules DROP COLUMN IF EXISTS webhook_url",
 ]
+
+
+class DatabaseUnavailable(RuntimeError):
+    """Raised when rule persistence is requested but there is no usable database."""
 
 
 def _ts(seconds: float) -> datetime:
@@ -118,38 +125,46 @@ class Database:
                 log.error("tick insert failed: %s", type(exc).__name__)
 
     # ---- rules -------------------------------------------------------
-    async def save_rule(self, rule: Rule) -> None:
+    # Rule methods raise on failure so callers can map errors to 503.
+    def _require_rules_pool(self) -> Any:
         if self._pool is None or not self._persist_rules:
-            return
-        try:
-            async with self._pool.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO alert_rules (id, symbol, type, threshold, window_seconds, "
-                    "created_at) VALUES ($1,$2,$3,$4,$5,$6) "
-                    "ON CONFLICT (id) DO UPDATE SET symbol=$2, type=$3, threshold=$4, "
-                    "window_seconds=$5",
-                    rule.id, rule.symbol, rule.type.value, rule.threshold,
-                    rule.window_seconds, rule.created_at,
-                )
-        except Exception as exc:
-            log.error("save_rule failed: %s", type(exc).__name__)
+            raise DatabaseUnavailable("database unavailable")
+        return self._pool
 
-    async def delete_rule(self, rule_id: str) -> None:
-        if self._pool is None or not self._persist_rules:
-            return
-        try:
-            async with self._pool.acquire() as conn:
-                await conn.execute("DELETE FROM alert_rules WHERE id = $1", rule_id)
-        except Exception as exc:
-            log.error("delete_rule failed: %s", type(exc).__name__)
+    async def save_rule(self, rule: Rule) -> None:
+        pool = self._require_rules_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO alert_rules (id, symbol, type, threshold, window_seconds, "
+                "created_at) VALUES ($1,$2,$3,$4,$5,$6)",
+                rule.id, rule.symbol, rule.type.value, rule.threshold,
+                rule.window_seconds, rule.created_at,
+            )
+
+    async def delete_rule(self, rule_id: str) -> bool:
+        pool = self._require_rules_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute("DELETE FROM alert_rules WHERE id = $1", rule_id)
+        return result.endswith(" 1")
+
+    async def list_rules(self, symbol: Optional[str] = None, limit: int = 50) -> list[Rule]:
+        pool = self._require_rules_pool()
+        async with pool.acquire() as conn:
+            if symbol:
+                rows = await conn.fetch(
+                    "SELECT * FROM alert_rules WHERE symbol = $1 "
+                    "ORDER BY created_at DESC, id DESC LIMIT $2",
+                    symbol, limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM alert_rules ORDER BY created_at DESC, id DESC LIMIT $1",
+                    limit,
+                )
+        return [Rule(**dict(r)) for r in rows]
 
     async def load_rules(self) -> list[Rule]:
-        if self._pool is None or not self._persist_rules:
-            return []
-        try:
-            async with self._pool.acquire() as conn:
-                rows = await conn.fetch("SELECT * FROM alert_rules")
-            return [Rule(**dict(r)) for r in rows]
-        except Exception as exc:
-            log.error("load_rules failed: %s", type(exc).__name__)
-            return []
+        pool = self._require_rules_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM alert_rules")
+        return [Rule(**dict(r)) for r in rows]
