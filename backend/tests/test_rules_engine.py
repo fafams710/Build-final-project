@@ -1,4 +1,6 @@
-from app.models import RuleCreate, Tick
+import pytest
+
+from app.models import Rule, Tick
 from app.rules import RuleEngine, RuleStore
 
 
@@ -9,7 +11,7 @@ def tick(price, t=0, symbol="AAPL"):
 async def setup(*rules):
     store = RuleStore()
     for r in rules:
-        await store.add(RuleCreate(symbol="AAPL", **r))
+        store.put(Rule(symbol="AAPL", **r))
     return store, RuleEngine(store)
 
 
@@ -54,7 +56,7 @@ async def test_multiple_rules_fire_independently_and_other_symbols_ignored():
     assert len(eng.evaluate(tick(115))) == 1  # only the second newly fires
 
 
-async def test_store_load_swallows_errors_and_does_not_persist():
+async def test_store_load_propagates_errors_and_does_not_persist():
     calls = []
 
     class BrokenRepo:
@@ -68,9 +70,11 @@ async def test_store_load_swallows_errors_and_does_not_persist():
             raise RuntimeError("db down")
 
     store = RuleStore(repo=BrokenRepo())
-    await store.load()  # must not raise; store stays empty
+    with pytest.raises(RuntimeError):
+        await store.load()  # propagates (startup fails loudly); store stays empty
     assert store.for_symbol("AAPL") == []
-    rule = await store.add(RuleCreate(symbol="aapl", type="price_above", threshold=1))
+    rule = Rule(symbol="aapl", type="price_above", threshold=1)
+    store.put(rule)
     assert store.for_symbol("AAPL") == [rule] and rule.symbol == "AAPL"
     store.discard(rule.id)
     store.discard(rule.id)

@@ -151,6 +151,29 @@ Update `CLAUDE.md`: layout, commands and invariants (see below).
 - **Database is now required.** Startup fails if Postgres is unreachable.
 - **Write volume.** Upserting a row per tick is heavy for busy symbols. Coalescing to the newest tick per symbol per batch keeps the load bounded.
 
+## Limitations (as built)
+
+These are the points where the build does not do everything that was wanted, recorded on purpose.
+
+### No degraded start without Postgres
+
+The first plan for the rules work (T005) was to keep the app running when Postgres is unavailable and answer rule
+requests with 503. That could not be kept at startup: if the watchlist or rules cannot be loaded, the app would start
+with nothing subscribed and no rules, and look healthy while doing nothing. Startup therefore fails loudly instead:
+if `RULES_PERSISTENCE_ENABLED=true` (the default) and Postgres is unreachable, `DATABASE_URL` is empty, or the
+database fails while loading rules, the watchlist or the watchlist backfill, the backend exits with a "startup failed"
+error that names the cause. A single malformed stored row (a rule or watchlist symbol that fails validation) does not
+stop startup: it is skipped with a warning and left in Postgres untouched. Docker Compose waits for a Postgres
+healthcheck (`pg_isready` over TCP) before starting the backend.
+
+What is still not managed:
+
+- The app cannot start in a degraded mode with Postgres down. `RULES_PERSISTENCE_ENABLED=false` is the only way to
+  start without a database, and then rules, alerts and the watchlist are not available (their endpoints return 503).
+- Postgres going down after a successful start is handled, not prevented: rule and alert endpoints return 503,
+  ingestion keeps running, and alerts raised during the outage are dropped (logged, with a rate-limited warning).
+  They are not retried later.
+
 ## Verification handoff
 
 After the build, run the offline suites. Then do a live check with a real Finnhub key: add `BINANCE:BTCUSDT`, click Refresh and see a price, create a low "price above" rule, click Refresh and see one alert, restart the stack and confirm everything persisted.

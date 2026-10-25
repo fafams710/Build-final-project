@@ -8,13 +8,13 @@ def tick_msg(ws):
             return m
 
 
-def test_single_upstream_started_and_stopped_once(settings):
+def test_single_upstream_started_and_stopped_once(settings, fake_db):
     from fastapi.testclient import TestClient
 
     from app.main import create_app
 
     FakeFinnhubClient.instances.clear()
-    app = create_app(settings, upstream_factory=FakeFinnhubClient.factory)
+    app = create_app(settings, upstream_factory=FakeFinnhubClient.factory, db=fake_db)
     with TestClient(app) as c:
         with c.websocket_connect("/ws") as a, c.websocket_connect("/ws") as b:
             for ws in (a, b):

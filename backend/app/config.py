@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     rules_persistence_enabled: bool = True
     ticks_persistence_enabled: bool = True
 
+    watchlist_max_symbols: int = 50
+
     reconnect_initial_seconds: float = 1.0
     reconnect_max_seconds: float = 30.0
 

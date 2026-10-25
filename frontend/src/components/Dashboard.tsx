@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { wsUrl } from "../api/client";
 import { useWebSocket } from "../hooks/useWebSocket";
+import AlertList from "./AlertList";
 import PriceTicker from "./PriceTicker";
 import RuleForm from "./RuleForm";
 import RuleList from "./RuleList";
@@ -51,6 +52,7 @@ export default function Dashboard() {
       <h2>Alert rules</h2>
       <RuleForm onCreated={() => setRulesVersion((v) => v + 1)} />
       <RuleList version={rulesVersion} />
+      <AlertList />
     </div>
   );
 }

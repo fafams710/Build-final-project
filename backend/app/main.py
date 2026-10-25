@@ -11,12 +11,26 @@ from .config import Settings, get_settings
 from .connection_manager import ConnectionManager
 from .db import Database
 from .finnhub_client import FinnhubClient
-from .models import Tick
-from .routers import health, rules as rules_router, symbols, ws
+from .models import Alert, Tick, normalize_symbol
+from .routers import alerts as alerts_router, health, rules as rules_router, symbols, ws
 from .rules import RuleEngine, RuleStore
 from .subscription_manager import SubscriptionManager
 
 log = logging.getLogger(__name__)
+
+
+def _configure_logging() -> None:
+    """Make INFO records from app.* visible under uvicorn/docker. Idempotent;
+    adds a handler only if neither the app nor the root logger has one."""
+    app_log = logging.getLogger("app")
+    if app_log.level == logging.NOTSET or app_log.level > logging.INFO:
+        app_log.setLevel(logging.INFO)
+    if not app_log.handlers and not logging.getLogger().handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s:     %(name)s: %(message)s"))
+        app_log.addHandler(handler)
+        app_log.propagate = False  # do not print twice if root gains a handler later
+
 
 # factory(settings, on_tick, get_symbols) -> object with async start/stop/subscribe/unsubscribe
 UpstreamFactory = Callable[[Settings, Callable, Callable], Any]
@@ -42,7 +56,11 @@ class Services:
     def __init__(self, settings: Settings, db=None) -> None:
         self.settings = settings
         self.upstream: Any = None
-        self._tasks: set[asyncio.Task] = set()
+        self.watchlist: set[str] = set()
+        # Serializes every upstream subscribe/unsubscribe decision + call so the
+        # last call reflects the latest state. Lock order: manager lock -> this.
+        self._upstream_lock = asyncio.Lock()
+        self._upstream_sent: set[str] = set()
 
         self.db = db or Database(
             settings.database_url,
@@ -54,18 +72,64 @@ class Services:
         self.rule_store = RuleStore(repo=self.db)
         self.engine = RuleEngine(self.rule_store)
 
+    # Upstream set == watchlist UNION browser-held symbols. Every path (browser
+    # subscribe/unsubscribe, rule creation) changes its own state and then calls
+    # _reconcile, which compares what is wanted with what was actually sent
+    # (_upstream_sent) under one lock. Nobody defers to anybody, so no
+    # interleaving can leave a wanted symbol unsent or an unwanted one sent.
+    # _upstream_sent semantics: a successful subscribe adds, a successful
+    # unsubscribe removes; a failed subscribe is not recorded (retried by the
+    # next reconcile of that symbol) and a failed unsubscribe keeps the symbol
+    # recorded (so a failed unsubscribe is retried, and a re-want sends nothing).
+    # On every (re)connect FinnhubClient resubscribes the wanted set via
+    # _symbols_for_connect, which resets the sent set to exactly that set.
+    def _wanted(self, symbol: str) -> bool:
+        return symbol in self.watchlist or self.subscriptions.ref_count(symbol) > 0
+
+    async def _reconcile(self, symbol: str) -> None:
+        async with self._upstream_lock:
+            if self.upstream is None:
+                return
+            wanted = self._wanted(symbol)
+            sent = symbol in self._upstream_sent
+            if wanted and not sent:
+                try:
+                    await self.upstream.subscribe(symbol)
+                except Exception as exc:
+                    log.warning("upstream subscribe failed for %s: %s", symbol, type(exc).__name__)
+                else:
+                    self._upstream_sent.add(symbol)
+            elif sent and not wanted:
+                try:
+                    await self.upstream.unsubscribe(symbol)
+                except Exception as exc:
+                    log.warning("upstream unsubscribe failed for %s: %s", symbol, type(exc).__name__)
+                else:
+                    self._upstream_sent.discard(symbol)
+
     async def _up_subscribe(self, symbol: str) -> None:
-        if self.upstream is not None:
-            await self.upstream.subscribe(symbol)
+        await self._reconcile(symbol)
 
     async def _up_unsubscribe(self, symbol: str) -> None:
-        if self.upstream is not None:
-            await self.upstream.unsubscribe(symbol)
+        await self._reconcile(symbol)
 
-    def _spawn(self, coro) -> None:
-        task = asyncio.create_task(coro)
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+    async def watch_symbol(self, symbol: str) -> None:
+        """Rule path: mark the symbol watched and reconcile upstream (one
+        subscribe if nothing sent it yet). Upstream failure is logged only."""
+        if symbol in self.watchlist:
+            return
+        self.watchlist.add(symbol)
+        await self._reconcile(symbol)
+
+    def upstream_symbols(self) -> list[str]:
+        return sorted(self.watchlist | set(self.subscriptions.active_symbols()))
+
+    def _symbols_for_connect(self) -> list[str]:
+        """get_symbols callable for the upstream client: it resubscribes this
+        set on every (re)connect, so the sent set becomes exactly the wanted set."""
+        wanted = self.upstream_symbols()
+        self._upstream_sent = set(wanted)
+        return wanted
 
     async def on_tick(self, tick: Tick) -> None:
         """Ingestion path. Everything before the broadcast is non-blocking."""
@@ -79,6 +143,16 @@ class Services:
                     event.get("rule_type"),
                     event.get("threshold"),
                     event.get("price"),
+                )
+                self.db.enqueue_alert(
+                    Alert(
+                        rule_id=rule.id,
+                        symbol=rule.symbol,
+                        rule_type=event["rule_type"],
+                        threshold=rule.threshold,
+                        price=event["price"],
+                        triggered_at=event["triggered_at"],
+                    )
                 )
         except Exception:
             log.exception("tick side-effects failed")
@@ -97,17 +171,52 @@ class Services:
             log.exception("broadcast failed")
 
     async def startup(self, factory: UpstreamFactory) -> None:
-        await self.db.connect()
-        await self.rule_store.load()
-        self.upstream = factory(self.settings, self.on_tick, self.subscriptions.active_symbols)
+        try:
+            await self._load_state()
+        except Exception:
+            # Fail loudly: release workers and pool, never start the upstream.
+            await self.db.close()
+            raise
+        self.upstream = factory(self.settings, self.on_tick, self._symbols_for_connect)
         if self.upstream is not None:
             await self.upstream.start()
+
+    async def _load_state(self) -> None:
+        """Connect to Postgres and load rules and watchlist. With
+        RULES_PERSISTENCE_ENABLED=true Postgres is required and any failure
+        raises; with false it is the explicit opt-out (start empty, rule and
+        alert endpoints answer 503)."""
+        await self.db.connect()
+        if not self.settings.rules_persistence_enabled:
+            return
+        if not self.db.available:
+            log.error(
+                "startup failed: Postgres unavailable: %s; "
+                "set RULES_PERSISTENCE_ENABLED=false to run without it",
+                getattr(self.db, "last_error", None) or "unknown error",
+            )
+            raise RuntimeError("Postgres unavailable at startup")
+        try:
+            await self.rule_store.load()
+            stored = await self.db.load_watchlist()
+        except Exception as exc:
+            log.error(
+                "startup failed: loading rules/watchlist: %s: %s; "
+                "set RULES_PERSISTENCE_ENABLED=false to run without it",
+                type(exc).__name__, exc,
+            )
+            raise
+        watchlist: set[str] = set()
+        for raw in stored:
+            try:
+                watchlist.add(normalize_symbol(raw))
+            except ValueError:
+                log.warning("skipping malformed watchlist symbol %r", raw)
+        self.watchlist = watchlist
 
     async def shutdown(self) -> None:
         if self.upstream is not None:
             await self.upstream.stop()
-        for task in list(self._tasks):
-            task.cancel()
         await self.db.close()
 
 
@@ -116,6 +225,7 @@ def create_app(
     upstream_factory: Optional[UpstreamFactory] = None,
     db=None,
 ) -> FastAPI:
+    _configure_logging()
     settings = settings or get_settings()
     factory = upstream_factory or default_upstream_factory
 
@@ -139,6 +249,7 @@ def create_app(
     app.include_router(health.router)
     app.include_router(symbols.router)
     app.include_router(rules_router.router)
+    app.include_router(alerts_router.router)
     app.include_router(ws.router)
     return app
 
