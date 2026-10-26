@@ -174,6 +174,19 @@ What is still not managed:
   ingestion keeps running, and alerts raised during the outage are dropped (logged, with a rate-limited warning).
   They are not retried later.
 
+### Tick history grows without limit
+
+Every price update from Finnhub is inserted into the `ticks` table, and nothing in the app reads or deletes those rows,
+so the table only grows. At, for example, 5 updates per second for one symbol, that is about 432,000 rows a day,
+roughly 13 million a month. Open decision 5 above left raw tick history out of the core build. Setting
+`TICKS_PERSISTENCE_ENABLED=false` stops the writing; there is no pruning.
+
+### Timestamps stored two ways
+
+`ticks` stores `exchange_ts` and `received_ts` as `TIMESTAMPTZ`, while `alert_rules.created_at`, `watchlist.created_at`
+and `alerts.triggered_at` store epoch seconds as `DOUBLE PRECISION`. The same kind of value has two representations in
+one database.
+
 ## Verification handoff
 
 After the build, run the offline suites. Then do a live check with a real Finnhub key: add `BINANCE:BTCUSDT`, click Refresh and see a price, create a low "price above" rule, click Refresh and see one alert, restart the stack and confirm everything persisted.
