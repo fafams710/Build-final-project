@@ -18,12 +18,12 @@ services:
 
   backend:
     build: ./backend
-    restart: unless-stopped
     environment:
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ticks}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
       APP_API_KEY: ${APP_API_KEY:?set APP_API_KEY in .env}
+    restart: unless-stopped
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:

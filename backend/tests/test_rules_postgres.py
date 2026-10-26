@@ -6,6 +6,7 @@ Set TEST_DATABASE_URL to a DISPOSABLE database: these tests DROP the
 import asyncio
 import os
 import time
+from urllib.parse import unquote, urlsplit
 
 import asyncpg
 import pytest
@@ -18,7 +19,47 @@ from app.models import Alert, Rule, Tick
 from tests.conftest import AUTH, TEST_KEY
 from tests.fakes.fake_finnhub import FakeFinnhubClient
 
+class UnsafeTestDatabase(Exception):
+    """TEST_DATABASE_URL is not safe to wipe; raised at import (collection error)."""
+
+
+def _parts(url: str, label: str) -> tuple[str, int, str]:
+    """(host, port, decoded database name); a missing port is 5432."""
+    try:
+        parts = urlsplit(url)
+        port = parts.port or 5432
+    except ValueError:
+        # Not chained or quoted: the message must not carry URL text.
+        raise UnsafeTestDatabase(f"{label} cannot be parsed (bad URL or port)") from None
+    path = parts.path
+    name = unquote(path[1:] if path.startswith("/") else path)
+    return parts.hostname or "", port, name
+
+
+def app_database_url() -> str:
+    """DATABASE_URL the way the app reads it (environment plus root .env)."""
+    return Settings().database_url
+
+
+def check_test_database_url(test_url: str, database_url: str) -> None:
+    """Refuse a TEST_DATABASE_URL that could wipe real data."""
+    host, port, name = _parts(test_url, "TEST_DATABASE_URL")
+    if not name or not name.lower().endswith("_test"):
+        raise UnsafeTestDatabase(
+            "Rule 1: the TEST_DATABASE_URL database name must end in _test "
+            "(and not be empty); refusing to drop tables"
+        )
+    if database_url.strip():
+        if (host, port, name) == _parts(database_url, "DATABASE_URL"):
+            raise UnsafeTestDatabase(
+                "Rule 2: TEST_DATABASE_URL has the same host, port and database "
+                "name as DATABASE_URL; refusing to drop tables"
+            )
+
+
 URL = os.environ.get("TEST_DATABASE_URL", "")
+if URL:
+    check_test_database_url(URL, app_database_url())
 
 pytestmark = pytest.mark.skipif(
     not URL, reason="TEST_DATABASE_URL not set; real-Postgres tests skipped"
